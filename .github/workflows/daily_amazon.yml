@@ -1,0 +1,57 @@
+name: Daily Amazon Data Pull
+
+on:
+  # Runs at 2:00 PM UTC = 9 AM ET / 6 AM PT
+  # Amazon finalises the previous day's data by ~12:00 PM UTC, so this is safe.
+  schedule:
+    - cron: '0 14 * * *'
+
+  # Manual trigger from the GitHub Actions UI — useful for backfills or re-runs.
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date to pull (YYYY-MM-DD). Leave blank for yesterday.'
+        required: false
+        default: ''
+
+jobs:
+  pull:
+    name: Pull Amazon → Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 45   # SP-API + Ads reports can take 15–30 min combined
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install python-amazon-sp-api==0.19.13 requests python-dotenv
+
+      - name: Pull Amazon data
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python scripts/daily_pull_supabase.py --date "${{ github.event.inputs.date }}"
+          else
+            python scripts/daily_pull_supabase.py
+          fi
+        env:
+          # ── SP-API ─────────────────────────────────────────────────────────
+          AMAZON_SP_CLIENT_ID:       ${{ secrets.AMAZON_SP_CLIENT_ID }}
+          AMAZON_SP_CLIENT_SECRET:   ${{ secrets.AMAZON_SP_CLIENT_SECRET }}
+          AMAZON_SP_REFRESH_TOKEN:   ${{ secrets.AMAZON_SP_REFRESH_TOKEN }}
+          AMAZON_MARKETPLACE_ID:     ${{ secrets.AMAZON_MARKETPLACE_ID }}
+          # ── Ads API ────────────────────────────────────────────────────────
+          AMAZON_ADS_CLIENT_ID:      ${{ secrets.AMAZON_ADS_CLIENT_ID }}
+          AMAZON_ADS_CLIENT_SECRET:  ${{ secrets.AMAZON_ADS_CLIENT_SECRET }}
+          AMAZON_ADS_REFRESH_TOKEN:  ${{ secrets.AMAZON_ADS_REFRESH_TOKEN }}
+          AMAZON_ADS_PROFILE_ID:     ${{ secrets.AMAZON_ADS_PROFILE_ID }}
+          # ── Supabase ───────────────────────────────────────────────────────
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # ── Brand ──────────────────────────────────────────────────────────
+          ACTIVE_BRAND:              xpro
