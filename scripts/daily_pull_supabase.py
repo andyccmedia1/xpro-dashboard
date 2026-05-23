@@ -406,14 +406,35 @@ def pull_day(target: date, brand: str) -> None:
     print()
 
 
+def date_range(start: date, end: date):
+    """Yield each date from start to end inclusive."""
+    current = start
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pull yesterday's Amazon data into Supabase")
-    parser.add_argument("--date",  help="YYYY-MM-DD (default: yesterday)")
+    parser = argparse.ArgumentParser(description="Pull Amazon data into Supabase")
+    parser.add_argument("--date",  help="Single date YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--start", help="Start of date range YYYY-MM-DD (use with --end for backfill)")
+    parser.add_argument("--end",   help="End of date range YYYY-MM-DD (use with --start for backfill)")
     parser.add_argument("--brand", default=ACTIVE_BRAND, help=f"Brand slug (default: {ACTIVE_BRAND})")
     args = parser.parse_args()
 
-    target = date.fromisoformat(args.date) if args.date else date.today() - timedelta(days=1)
-    pull_day(target, args.brand)
+    if args.start and args.end:
+        # Date range backfill
+        start = date.fromisoformat(args.start)
+        end   = date.fromisoformat(args.end)
+        dates = list(date_range(start, end))
+        log.info(f"Backfill mode: {start} → {end} ({len(dates)} days)")
+        for i, target in enumerate(dates, 1):
+            log.info(f"[{i}/{len(dates)}] Processing {target}…")
+            pull_day(target, args.brand)
+    else:
+        # Single day (default: yesterday)
+        target = date.fromisoformat(args.date) if args.date else date.today() - timedelta(days=1)
+        pull_day(target, args.brand)
 
 
 if __name__ == "__main__":

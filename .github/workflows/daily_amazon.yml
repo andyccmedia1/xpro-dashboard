@@ -10,7 +10,15 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: 'Date to pull (YYYY-MM-DD). Leave blank for yesterday.'
+        description: 'Single date (YYYY-MM-DD). Leave blank for yesterday.'
+        required: false
+        default: ''
+      start_date:
+        description: 'Backfill start date (YYYY-MM-DD). Use with end_date.'
+        required: false
+        default: ''
+      end_date:
+        description: 'Backfill end date (YYYY-MM-DD). Use with start_date.'
         required: false
         default: ''
 
@@ -18,7 +26,7 @@ jobs:
   pull:
     name: Pull Amazon → Supabase
     runs-on: ubuntu-latest
-    timeout-minutes: 45   # SP-API + Ads reports can take 15–30 min combined
+    timeout-minutes: 360  # up to 6 hours — covers multi-month backfills (~4 min/day)
 
     steps:
       - name: Checkout repo
@@ -34,7 +42,9 @@ jobs:
 
       - name: Pull Amazon data
         run: |
-          if [ -n "${{ github.event.inputs.date }}" ]; then
+          if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
+            python scripts/daily_pull_supabase.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
+          elif [ -n "${{ github.event.inputs.date }}" ]; then
             python scripts/daily_pull_supabase.py --date "${{ github.event.inputs.date }}"
           else
             python scripts/daily_pull_supabase.py
