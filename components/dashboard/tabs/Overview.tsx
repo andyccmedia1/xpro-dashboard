@@ -138,8 +138,8 @@ export default function Overview({ start, end, brand = 'xpro' }: Props) {
               <Tooltip
                 contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }}
                 labelStyle={{ color: '#9ca3af', fontSize: 12 }}
-                formatter={(value: number, name: string) => [
-                  '$' + value.toLocaleString('en-US', { maximumFractionDigits: 0 }),
+                formatter={(value: unknown, name: string) => [
+                  '$' + Number(value).toLocaleString('en-US', { maximumFractionDigits: 0 }),
                   name,
                 ]}
                 labelFormatter={fmtDate}

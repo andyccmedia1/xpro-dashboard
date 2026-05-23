@@ -161,7 +161,7 @@ export default function Channels({ start, end, brand = 'xpro' }: Props) {
                 <Tooltip
                   contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }}
                   labelStyle={{ color: '#9ca3af', fontSize: 12 }}
-                  formatter={(v: number, name: string) => ['$' + v.toLocaleString('en-US', { maximumFractionDigits: 0 }), name]}
+                  formatter={(v: unknown, name: string) => ['$' + Number(v).toLocaleString('en-US', { maximumFractionDigits: 0 }), name]}
                   labelFormatter={fmtDate}
                 />
                 <Legend wrapperStyle={{ fontSize: 12, color: '#9ca3af', paddingTop: 12 }} />
@@ -185,7 +185,7 @@ export default function Channels({ start, end, brand = 'xpro' }: Props) {
                   <Pie data={revPie} dataKey="value" cx="50%" cy="50%" outerRadius={80} innerRadius={40} labelLine={false} label={renderPieLabel}>
                     {revPie.map((entry, i) => <Cell key={i} fill={entry.color} />)}
                   </Pie>
-                  <Tooltip formatter={(v: number) => fmtPct(v)} contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }} />
+                  <Tooltip formatter={(v: unknown) => fmtPct(v as number)} contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }} />
                 </PieChart>
               </ResponsiveContainer>
               <div className="mt-auto space-y-2">
