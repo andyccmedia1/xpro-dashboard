@@ -17,8 +17,8 @@ async function fetchChannels(start: string, end: string, brand: string) {
 const fmt$   = (v: number) => '$' + v.toLocaleString('en-US', { maximumFractionDigits: 0 })
 const fmtPct = (v: number) => (v * 100).toFixed(1) + '%'
 const fmtX   = (v: number | null) => v == null ? '—' : v.toFixed(2) + 'x'
-const fmtDate = (d: string) => {
-  const dt = new Date(d + 'T00:00:00')
+const fmtDate = (d: unknown) => {
+  const dt = new Date(String(d) + 'T00:00:00')
   return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 

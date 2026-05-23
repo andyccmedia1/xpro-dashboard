@@ -15,7 +15,7 @@ async function fetchSkus(start: string, end: string, brand: string) {
 const fmt$   = (v: number) => '$' + v.toLocaleString('en-US', { maximumFractionDigits: 0 })
 const fmtPct = (v: number | null) => v == null ? '—' : (v * 100).toFixed(1) + '%'
 const fmtNum = (v: number) => v.toLocaleString('en-US')
-const fmtDate = (d: string) => new Date(d + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+const fmtDate = (d: unknown) => new Date(String(d) + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 
 type SortKey = 'ordered_product_sales' | 'sessions' | 'units_ordered' | 'avg_cvr' | 'avg_buy_box_pct'
 

@@ -17,7 +17,7 @@ async function fetchLevers(start: string, end: string, brand: string) {
 const fmt$  = (v: number | null) => v == null ? '—' : '$' + v.toLocaleString('en-US', { maximumFractionDigits: 0 })
 const fmtX  = (v: number | null) => v == null ? '—' : v.toFixed(2) + 'x'
 const fmtPct= (v: number | null) => v == null ? '—' : (v * 100).toFixed(1) + '%'
-const fmtDate = (d: string) => { const dt = new Date(d + 'T00:00:00'); return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) }
+const fmtDate = (d: unknown) => { const dt = new Date(String(d) + 'T00:00:00'); return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) }
 
 function roasColor(v: number | null) {
   if (v == null) return 'text-gray-400'
