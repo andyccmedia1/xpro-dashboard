@@ -93,7 +93,7 @@ export default function LeverAnalysis({ start, end, brand = 'xpro' }: Props) {
               <Tooltip
                 contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }}
                 labelStyle={{ color: '#9ca3af', fontSize: 12 }}
-                formatter={(v: unknown, name: string) => ['$' + Number(v).toLocaleString('en-US', { maximumFractionDigits: 0 }), name]}
+                formatter={(v: unknown, name: unknown) => ['$' + Number(v).toLocaleString('en-US', { maximumFractionDigits: 0 }), String(name)]}
                 labelFormatter={fmtDate}
               />
               <Legend wrapperStyle={{ fontSize: 12, color: '#9ca3af', paddingTop: 12 }} />
@@ -122,9 +122,9 @@ export default function LeverAnalysis({ start, end, brand = 'xpro' }: Props) {
               <Tooltip
                 contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }}
                 labelStyle={{ color: '#9ca3af', fontSize: 12 }}
-                formatter={(v: unknown, name: string) => {
-                  const n = Number(v)
-                  return name === 'ROAS' ? [n.toFixed(2) + 'x', name] : [(n*100).toFixed(1)+'%', name]
+                formatter={(v: unknown, name: unknown) => {
+                  const n = Number(v); const s = String(name)
+                  return s === 'ROAS' ? [n.toFixed(2) + 'x', s] : [(n*100).toFixed(1)+'%', s]
                 }}
                 labelFormatter={fmtDate}
               />
