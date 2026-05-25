@@ -246,43 +246,117 @@ def _sp_parse_asin(content: str) -> dict[str, dict]:
 def ads_pull_range(start: date, end: date) -> dict[str, float]:
     """
     Pull daily PPC spend (SP + SB + SD) for [start, end].
-    Batches into 30-day chunks — a 90-day range = 3 chunks × 3 ad types = 9 reports
-    instead of 90 days × 3 types = 270 reports.
+
+    Fan-out strategy: submit ALL reports first (one per ad-type per 30-day chunk),
+    then poll them all together. This means SP/SB/SD generation overlaps instead
+    of being sequential — cuts wait time by ~3x vs the old serial approach.
+
     Returns {'YYYY-MM-DD': total_spend}.
     """
     token   = _ads_token()
     headers = _ads_headers(token)
-    daily: dict[str, float] = {}
     retention_cutoff = date.today() - timedelta(days=_SB_SD_RETENTION_DAYS)
+    chunks  = list(chunk_dates(start, end, _ADS_CHUNK_DAYS))
+
+    # ── Step 1: submit all reports upfront ─────────────────────
+    # [(report_id, label, description), ...]
+    pending: list[tuple[str, str, str]] = []
 
     for i, ad_type in enumerate(_AD_TYPES):
         if i > 0:
-            log.info(f"Pausing 60s before {ad_type['label']} batch…")
-            time.sleep(60)
-
-        chunks = list(chunk_dates(start, end, _ADS_CHUNK_DAYS))
-        log.info(f"Ads API {ad_type['label']}: {len(chunks)} chunk(s)")
+            # Small pause between ad-type submission bursts to avoid 429
+            log.info(f"Pausing 15s before submitting {ad_type['label']} reports…")
+            time.sleep(15)
 
         for j, (cs, ce) in enumerate(chunks, 1):
-            # SB/SD have limited retention — skip chunks before the window
             if ad_type["label"] in ("SB", "SD") and ce < retention_cutoff:
-                log.info(f"  Skipping {ad_type['label']} chunk {j}: {cs}–{ce} outside retention")
+                log.info(f"  Skipping {ad_type['label']} {cs}–{ce}: outside retention window")
                 continue
-            # Clamp start to retention window if partly out of range
             eff_start = max(cs, retention_cutoff) if ad_type["label"] in ("SB", "SD") else cs
+            desc = f"{ad_type['label']} {eff_start}–{ce}"
 
-            log.info(f"  {ad_type['label']} chunk {j}/{len(chunks)}: {eff_start} → {ce}")
             try:
-                report_id = _ads_request_report(headers, eff_start, ce, ad_type)
-                url       = _ads_wait(headers, report_id)
-                chunk     = _ads_parse(url)
-                for day, spend in chunk.items():
-                    daily[day] = daily.get(day, 0.0) + spend
-                log.info(f"    Got {len(chunk)} day(s) of {ad_type['label']} spend")
+                report_id = _ads_request_with_retry(headers, eff_start, ce, ad_type)
+                pending.append((report_id, ad_type["label"], desc))
+                log.info(f"  Submitted {desc}: {report_id}")
             except Exception as exc:
-                log.warning(f"  {ad_type['label']} chunk {j} failed (skipping): {exc}")
+                log.warning(f"  Failed to submit {desc}: {exc}")
+
+    if not pending:
+        log.warning("No Ads API reports were submitted — returning empty spend data")
+        return {}
+
+    log.info(f"Submitted {len(pending)} report(s). Polling until all complete (30-min timeout)…")
+
+    # ── Step 2: poll all reports together ──────────────────────
+    completed: list[tuple[str, str]] = []   # [(url, label)]
+    remaining = list(pending)
+    deadline  = time.time() + 1800          # 30-minute total timeout
+
+    while remaining and time.time() < deadline:
+        time.sleep(30)
+        still_pending = []
+        for report_id, label, desc in remaining:
+            try:
+                resp = requests.get(
+                    f"{_ADS_BASE_URL}/reporting/reports/{report_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data   = resp.json()
+                status = data.get("status")
+                if status == "COMPLETED":
+                    completed.append((data["url"], label))
+                    log.info(f"  ✓ {desc} complete")
+                elif status in ("FAILURE", "CANCELLED"):
+                    log.warning(f"  ✗ {desc} failed: {status} — {data.get('statusDetails', '')}")
+                else:
+                    still_pending.append((report_id, label, desc))
+                    log.debug(f"  {desc}: {status}")
+            except Exception as exc:
+                log.warning(f"  Poll error for {desc}: {exc}")
+                still_pending.append((report_id, label, desc))
+
+        remaining = still_pending
+        if remaining:
+            log.info(f"  Still waiting on {len(remaining)} report(s)…")
+
+    if remaining:
+        log.warning(f"Timed out — {len(remaining)} report(s) never completed: "
+                    f"{[d for _, _, d in remaining]}")
+
+    # ── Step 3: download and sum all completed reports ──────────
+    daily: dict[str, float] = {}
+    for url, label in completed:
+        try:
+            chunk = _ads_parse(url)
+            for day, spend in chunk.items():
+                daily[day] = daily.get(day, 0.0) + spend
+            log.info(f"  Parsed {label}: {len(chunk)} day(s)")
+        except Exception as exc:
+            log.warning(f"  Failed to parse {label} result: {exc}")
 
     return daily
+
+
+def _ads_request_with_retry(headers: dict, start: date, end: date, ad_type: dict,
+                             max_retries: int = 4) -> str:
+    """Submit an Ads API report request, retrying on 429 with exponential backoff."""
+    backoff = [30, 60, 120, 240]
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            wait = backoff[min(attempt - 1, len(backoff) - 1)]
+            log.info(f"  Retry {attempt}/{max_retries} for {ad_type['label']}, waiting {wait}s…")
+            time.sleep(wait)
+        try:
+            return _ads_request_report(headers, start, end, ad_type)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 429 and attempt < max_retries:
+                log.warning(f"  429 on {ad_type['label']} submission — will retry")
+                continue
+            raise
+    raise RuntimeError(f"Exhausted retries for {ad_type['label']}")
 
 
 def _ads_token() -> str:
