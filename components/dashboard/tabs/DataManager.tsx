@@ -18,7 +18,13 @@ const CHANNELS = [
 // exact column name, then treats everything after it as data.
 
 function parseDate(raw: string): Date | null {
-  if (!raw) return null
+  if (!raw || raw === '-') return null
+  // YYYY-MM-DD HH:MM:SS — TikTok Ads export includes a timestamp, strip it
+  const withTimestamp = raw.match(/^(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}$/)
+  if (withTimestamp) {
+    const dt = new Date(withTimestamp[1] + 'T00:00:00')
+    return isNaN(dt.getTime()) ? null : dt
+  }
   // DD/MM/YYYY or D/M/YYYY — TikTok Shop exports European format
   const dmy = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
   if (dmy) {
@@ -43,8 +49,9 @@ function parseCSV(text: string, channel: string): { rows: {date:string,value:num
   for (let i = 0; i < Math.min(lines.length, 25); i++) {
     const cols = lines[i].split(',').map(h => h.replace(/"/g, '').trim().toLowerCase())
     console.log(`[CSV] line ${i}:`, cols.slice(0, 4))
-    // Require an exact "date" or "day" column (not "analysis date: …" metadata)
-    if (cols.some(h => h === 'date' || h === 'day')) {
+    // Match common date column names exactly (avoid partial matches like "analysis date: …")
+    const DATE_COLS = ['date', 'day', 'by day', 'report date', 'week', 'month']
+    if (cols.some(h => DATE_COLS.includes(h))) {
       headerLineIdx = i
       headers = cols
       console.log('[CSV] header found at line', i, '| cols:', cols.slice(0, 5))
@@ -53,7 +60,8 @@ function parseCSV(text: string, channel: string): { rows: {date:string,value:num
   }
   if (headerLineIdx === -1) return { rows: [], errors: ['Could not find a header row with a Date column'] }
 
-  const dateIdx = headers.findIndex(h => h === 'date' || h === 'day')
+  const DATE_COLS = ['date', 'day', 'by day', 'report date', 'week', 'month']
+  const dateIdx = headers.findIndex(h => DATE_COLS.includes(h))
 
   // Find value column — preference order varies by channel
   const valueCandidates: Record<string, string[]> = {
@@ -82,8 +90,8 @@ function parseCSV(text: string, channel: string): { rows: {date:string,value:num
     const rawDate  = cells[dateIdx]  ?? ''
     const rawValue = cells[valueIdx] ?? ''
 
-    // Skip obvious non-data rows (subtotals, footers)
-    if (!rawDate || rawDate.toLowerCase().includes('total') || rawDate.toLowerCase().includes('change')) continue
+    // Skip totals/footer rows — TikTok Ads uses "-" for the totals date cell
+    if (!rawDate || rawDate === '-' || rawDate.toLowerCase().includes('total') || rawDate.toLowerCase().includes('change')) continue
 
     const parsed = parseDate(rawDate)
     if (!parsed) { errors.push(`Row ${i + 1}: bad date "${rawDate}"`); continue }
