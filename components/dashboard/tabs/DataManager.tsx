@@ -13,51 +13,83 @@ const CHANNELS = [
 ]
 
 // ── CSV parser ────────────────────────────────────────────────────────────────
-// Tries to auto-detect the date column and value column from headers.
+// Handles exports that have metadata rows before the real header (e.g. TikTok Shop).
+// Scans the first 25 rows to find the line where "date" or "day" appears as an
+// exact column name, then treats everything after it as data.
+
+function parseDate(raw: string): Date | null {
+  if (!raw) return null
+  // DD/MM/YYYY or D/M/YYYY — TikTok Shop exports European format
+  const dmy = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+  if (dmy) {
+    const [, d, m, y] = dmy
+    const dt = new Date(`${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}T00:00:00`)
+    return isNaN(dt.getTime()) ? null : dt
+  }
+  // YYYY-MM-DD, MM/DD/YYYY, "May 12, 2026", etc.
+  const dt = new Date(raw + (raw.includes('T') ? '' : 'T00:00:00'))
+  return isNaN(dt.getTime()) ? null : dt
+}
+
 function parseCSV(text: string, channel: string): { rows: {date:string,value:number}[]; errors: string[] } {
   const lines = text.trim().split(/\r?\n/)
   if (lines.length < 2) return { rows: [], errors: ['CSV has no data rows'] }
 
-  const headers = lines[0].split(',').map(h => h.replace(/"/g, '').trim().toLowerCase())
+  // Scan up to 25 rows to find the actual header row.
+  // TikTok Shop exports have 8 rows of metadata before the real "Date,GMV,…" header.
+  let headerLineIdx = -1
+  let headers: string[] = []
+  for (let i = 0; i < Math.min(lines.length, 25); i++) {
+    const cols = lines[i].split(',').map(h => h.replace(/"/g, '').trim().toLowerCase())
+    // Require an exact "date" or "day" column (not "analysis date: …" metadata)
+    if (cols.some(h => h === 'date' || h === 'day')) {
+      headerLineIdx = i
+      headers = cols
+      break
+    }
+  }
+  if (headerLineIdx === -1) return { rows: [], errors: ['Could not find a header row with a Date column'] }
 
-  // Find date column
-  const dateIdx = headers.findIndex(h => h.includes('date') || h === 'day')
-  if (dateIdx === -1) return { rows: [], errors: ['Could not find a Date column'] }
+  const dateIdx = headers.findIndex(h => h === 'date' || h === 'day')
 
   // Find value column — preference order varies by channel
   const valueCandidates: Record<string, string[]> = {
     shopify:      ['net sales', 'net revenue', 'revenue', 'total sales', 'gross sales'],
-    tiktok:       ['revenue', 'net revenue', 'gmv', 'settled gmv', 'total revenue'],
+    tiktok:       ['gmv', 'revenue', 'net revenue', 'settled gmv', 'total revenue'],
     tiktok_spend: ['spend', 'cost', 'total cost', 'amount spent', 'total spend'],
     meta_spend:   ['amount spent', 'spend', 'cost', 'total cost'],
   }
   const candidates = valueCandidates[channel] ?? ['revenue', 'amount', 'value']
   let valueIdx = -1
   for (const c of candidates) {
-    valueIdx = headers.findIndex(h => h.includes(c))
+    valueIdx = headers.findIndex(h => h === c || h.startsWith(c))
     if (valueIdx !== -1) break
   }
   if (valueIdx === -1) {
-    // Fall back to second numeric-looking column
+    // Fall back to first non-date column
     valueIdx = headers.findIndex((_, i) => i !== dateIdx)
   }
 
   const rows: {date:string,value:number}[] = []
   const errors: string[] = []
 
-  for (let i = 1; i < lines.length; i++) {
+  for (let i = headerLineIdx + 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue
     const cells = lines[i].split(',').map(c => c.replace(/"/g, '').trim())
     const rawDate  = cells[dateIdx]  ?? ''
     const rawValue = cells[valueIdx] ?? ''
 
-    // Normalise date to YYYY-MM-DD
-    const parsed = new Date(rawDate)
-    if (isNaN(parsed.getTime())) { errors.push(`Row ${i + 1}: bad date "${rawDate}"`); continue }
+    // Skip obvious non-data rows (subtotals, footers)
+    if (!rawDate || rawDate.toLowerCase().includes('total') || rawDate.toLowerCase().includes('change')) continue
+
+    const parsed = parseDate(rawDate)
+    if (!parsed) { errors.push(`Row ${i + 1}: bad date "${rawDate}"`); continue }
     const date = parsed.toISOString().slice(0, 10)
 
-    // Strip currency symbols, commas
-    const value = parseFloat(rawValue.replace(/[$,\s]/g, ''))
+    // Strip currency symbols, commas, dashes (TikTok uses "-" for zero)
+    const cleanValue = rawValue.replace(/[$,\s]/g, '')
+    if (cleanValue === '-' || cleanValue === '') { continue } // skip zero/blank rows silently
+    const value = parseFloat(cleanValue)
     if (isNaN(value)) { errors.push(`Row ${i + 1}: bad value "${rawValue}"`); continue }
 
     rows.push({ date, value })
