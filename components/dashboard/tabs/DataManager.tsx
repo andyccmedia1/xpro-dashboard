@@ -45,16 +45,13 @@ function parseCSV(text: string, channel: string): { rows: {date:string,value:num
   // TikTok Shop exports have 8 rows of metadata before the real "Date,GMV,…" header.
   let headerLineIdx = -1
   let headers: string[] = []
-  console.log('[CSV] total lines:', lines.length, '| channel:', channel)
   for (let i = 0; i < Math.min(lines.length, 25); i++) {
     const cols = lines[i].split(',').map(h => h.replace(/"/g, '').trim().toLowerCase())
-    console.log(`[CSV] line ${i}:`, cols.slice(0, 4))
     // Match common date column names exactly (avoid partial matches like "analysis date: …")
     const DATE_COLS = ['date', 'day', 'by day', 'report date', 'week', 'month']
     if (cols.some(h => DATE_COLS.includes(h))) {
       headerLineIdx = i
       headers = cols
-      console.log('[CSV] header found at line', i, '| cols:', cols.slice(0, 5))
       break
     }
   }
