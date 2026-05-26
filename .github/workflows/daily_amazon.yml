@@ -1,10 +1,11 @@
 name: Daily Amazon Data Pull
 
 on:
-  # Runs at 2:00 PM UTC = 9 AM ET / 6 AM PT
+  # Runs at 1:00 PM UTC = 9 AM ET / 6 AM PT (scheduled).
+  # GitHub Actions typically fires 1-2 h late → actual ~2-3 PM UTC.
   # Amazon finalises the previous day's data by ~12:00 PM UTC, so this is safe.
   schedule:
-    - cron: '0 14 * * *'
+    - cron: '0 13 * * *'
 
   # Manual trigger from the GitHub Actions UI — useful for backfills or re-runs.
   workflow_dispatch:
