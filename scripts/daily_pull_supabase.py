@@ -3,7 +3,9 @@
 Amazon data pull → Supabase.
 
 DAILY MODE (default — runs via cron):
-    Pulls yesterday's data including per-ASIN traffic. One SP-API report +
+    Pulls yesterday's data including per-ASIN traffic. Also automatically
+    scans the last 30 days for any gaps (e.g. days GitHub Actions skipped)
+    and backfills them before pulling yesterday. One SP-API report +
     three Ads API reports. Takes ~4–8 minutes.
 
 BACKFILL MODE (--start / --end):
@@ -13,8 +15,8 @@ BACKFILL MODE (--start / --end):
     (daily pulls going forward will populate it).
 
 Usage:
-    python scripts/daily_pull_supabase.py                            # yesterday
-    python scripts/daily_pull_supabase.py --date 2026-05-20         # single day
+    python scripts/daily_pull_supabase.py                            # yesterday + auto-gap-fill
+    python scripts/daily_pull_supabase.py --date 2026-05-20         # single day (no gap scan)
     python scripts/daily_pull_supabase.py --start 2026-01-01 --end 2026-05-24  # backfill
 
 Required env vars:
@@ -470,6 +472,94 @@ def supabase_upsert(table: str, rows: list[dict]) -> None:
     log.info(f"✓ Upserted {len(rows)} row(s) → {table}")
 
 
+# ── Gap detection ──────────────────────────────────────────────────────────────
+
+def get_existing_dates(start: date, end: date, brand: str) -> set[str]:
+    """
+    Query Supabase for dates in [start, end] that already have Amazon data.
+    A date is considered present only if at least one of amazon_revenue or
+    amazon_ppc_spend is non-null (i.e. the API actually returned something).
+    """
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/daily_data",
+        headers={
+            "apikey":        SERVICE_KEY,
+            "Authorization": f"Bearer {SERVICE_KEY}",
+        },
+        params=[
+            ("select", "date,amazon_revenue,amazon_ppc_spend"),
+            ("brand",  f"eq.{brand}"),
+            ("date",   f"gte.{start}"),
+            ("date",   f"lte.{end}"),
+        ],
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return {
+        r["date"]
+        for r in resp.json()
+        if r.get("amazon_revenue") is not None or r.get("amazon_ppc_spend") is not None
+    }
+
+
+def find_gaps(start: date, end: date, brand: str) -> list[tuple[date, date]]:
+    """
+    Return a list of (gap_start, gap_end) ranges that are missing Amazon data
+    in Supabase for the given brand. Consecutive missing days are merged into
+    a single range so the backfill uses as few API calls as possible.
+    """
+    existing = get_existing_dates(start, end, brand)
+    missing  = [d for d in date_range(start, end) if d.strftime("%Y-%m-%d") not in existing]
+    if not missing:
+        return []
+
+    # Group consecutive days into ranges
+    ranges: list[tuple[date, date]] = []
+    gap_start = gap_end = missing[0]
+    for d in missing[1:]:
+        if d == gap_end + timedelta(days=1):
+            gap_end = d
+        else:
+            ranges.append((gap_start, gap_end))
+            gap_start = gap_end = d
+    ranges.append((gap_start, gap_end))
+    return ranges
+
+
+def auto_backfill_gaps(brand: str, lookback_days: int = 30) -> None:
+    """
+    Scan the last `lookback_days` days and backfill any that are missing.
+    Called automatically in daily cron mode so skipped GitHub Actions runs
+    are caught and filled on the next successful execution.
+    """
+    today = date.today()
+    end   = today - timedelta(days=1)          # yesterday (today not yet finalised)
+    start = today - timedelta(days=lookback_days)
+
+    log.info(f"Gap scan: checking [{start} → {end}] for missing data…")
+    try:
+        gaps = find_gaps(start, end, brand)
+    except Exception as exc:
+        log.warning(f"Gap scan failed (Supabase query error): {exc} — skipping auto-backfill")
+        return
+
+    if not gaps:
+        log.info("  No gaps found — all days present ✓")
+        return
+
+    total_missing = sum((ge - gs).days + 1 for gs, ge in gaps)
+    log.info(f"  Found {total_missing} missing day(s) across {len(gaps)} gap(s):")
+    for gs, ge in gaps:
+        log.info(f"    {gs} → {ge}")
+
+    for gs, ge in gaps:
+        log.info(f"Backfilling gap {gs} → {ge}…")
+        try:
+            backfill_range(gs, ge, brand)
+        except Exception as exc:
+            log.error(f"  Backfill of {gs}→{ge} failed: {exc}")
+
+
 # ── Orchestration ──────────────────────────────────────────────────────────────
 
 def pull_day(target: date, brand: str) -> None:
@@ -593,9 +683,13 @@ def main() -> None:
             date.fromisoformat(args.end),
             args.brand,
         )
+    elif args.date:
+        # Explicit single date — no gap scan, just pull that day
+        pull_day(date.fromisoformat(args.date), args.brand)
     else:
-        target = date.fromisoformat(args.date) if args.date else date.today() - timedelta(days=1)
-        pull_day(target, args.brand)
+        # Default cron mode: scan for gaps first, then pull yesterday
+        auto_backfill_gaps(args.brand, lookback_days=30)
+        pull_day(date.today() - timedelta(days=1), args.brand)
 
 
 if __name__ == "__main__":
