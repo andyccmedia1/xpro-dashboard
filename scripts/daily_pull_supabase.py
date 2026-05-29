@@ -176,6 +176,83 @@ def sp_pull_single_day(target: date) -> tuple[dict[str, float], dict[str, dict]]
     return _sp_parse_daily(content), _sp_parse_asin(content)
 
 
+def sp_pull_days_fanout(targets: list[date]) -> dict[str, tuple[float | None, dict[str, dict]]]:
+    """
+    Pull revenue + per-ASIN traffic for multiple days simultaneously (fan-out).
+    Returns {date_str: (revenue_or_none, {asin: metrics})}.
+
+    Amazon ASIN traffic data (sessions, CVR, Buy Box %) can take 2-4 days to be
+    finalised after the trading day ends. By submitting reports for the last 3 days
+    on every run we automatically pick up the delayed data once Amazon publishes it.
+    All reports are submitted upfront and polled together — no sequential waiting.
+    """
+    api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
+    pending: list[tuple[str, str]] = []   # (report_id, date_str)
+
+    for i, target in enumerate(targets):
+        if i > 0:
+            time.sleep(5)   # small gap between submissions to avoid rate limits
+        try:
+            resp = api.create_report(
+                reportType="GET_SALES_AND_TRAFFIC_REPORT",
+                dataStartTime=target.strftime("%Y-%m-%dT00:00:00Z"),
+                dataEndTime=target.strftime("%Y-%m-%dT23:59:59Z"),
+                reportOptions={"dateGranularity": "DAY", "asinGranularity": "CHILD"},
+                marketplaceIds=[SP_MARKETPLACE_ID],
+            )
+            report_id = resp.payload["reportId"]
+            pending.append((report_id, target.strftime("%Y-%m-%d")))
+            log.info(f"  Submitted SP report for {target}: {report_id}")
+        except Exception as exc:
+            log.warning(f"  Failed to submit SP report for {target}: {exc}")
+
+    if not pending:
+        return {}
+
+    log.info(f"  Polling {len(pending)} SP report(s) together…")
+    completed: list[tuple[str, str]] = []   # (doc_id, date_str)
+    remaining = list(pending)
+    deadline  = time.time() + 1800
+
+    while remaining and time.time() < deadline:
+        time.sleep(30)
+        still_pending = []
+        for report_id, date_str in remaining:
+            try:
+                r      = api.get_report(reportId=report_id)
+                status = r.payload["processingStatus"]
+                if status == "DONE":
+                    completed.append((r.payload["reportDocumentId"], date_str))
+                    log.info(f"  ✓ SP report {date_str} done")
+                elif status in ("FATAL", "CANCELLED"):
+                    log.warning(f"  ✗ SP report {date_str}: {status}")
+                else:
+                    still_pending.append((report_id, date_str))
+            except Exception as exc:
+                log.warning(f"  Poll error SP {date_str}: {exc}")
+                still_pending.append((report_id, date_str))
+        remaining = still_pending
+        if remaining:
+            log.info(f"  Still waiting on {len(remaining)} SP report(s)…")
+
+    if remaining:
+        log.warning(f"SP fan-out timed out — never completed: {[d for _, d in remaining]}")
+
+    results: dict[str, tuple[float | None, dict[str, dict]]] = {}
+    for doc_id, date_str in completed:
+        try:
+            content  = _sp_download(api, doc_id)
+            daily_rev = _sp_parse_daily(content)
+            asin_data = _sp_parse_asin(content)
+            revenue   = daily_rev.get(date_str)
+            results[date_str] = (revenue, asin_data)
+            log.info(f"  Parsed {date_str}: revenue={revenue}, {len(asin_data)} ASINs")
+        except Exception as exc:
+            log.warning(f"  Failed to parse SP report {date_str}: {exc}")
+
+    return results
+
+
 def _sp_wait(api: Reports, report_id: str, timeout: int = 900, interval: int = 30) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -563,22 +640,57 @@ def auto_backfill_gaps(brand: str, lookback_days: int = 30) -> None:
 # ── Orchestration ──────────────────────────────────────────────────────────────
 
 def pull_day(target: date, brand: str) -> None:
-    """Single day pull — revenue + ASIN traffic + PPC spend."""
+    """
+    Single day pull — revenue + ASIN traffic + PPC spend.
+
+    SP-API reports are requested for the last 3 days simultaneously (fan-out)
+    so that delayed ASIN traffic data (sessions, CVR, Buy Box %) is refreshed
+    once Amazon finalises it. Amazon typically takes 2-4 days to publish
+    accurate session counts — pulling only yesterday leaves recent rows at 0.
+    """
     log.info(f"{'='*60}")
     log.info(f"DAILY PULL: {target}  (brand: {brand})")
     log.info(f"{'='*60}")
 
-    # SP-API: revenue + ASIN traffic
+    # SP-API: fan-out last 3 days so delayed session/CVR data gets refreshed
+    # day-1 = target (revenue + fresh ASIN), day-2 and day-3 = ASIN refresh only
+    sp_days = [target - timedelta(days=i) for i in range(3)]
+    log.info(f"SP-API: submitting reports for {sp_days[-1]} → {sp_days[0]} (3 days)…")
+
     revenue: float | None = None
     asin_traffic: dict[str, dict] = {}
     try:
-        daily_rev, asin_traffic = sp_pull_single_day(target)
-        revenue = daily_rev.get(target.strftime("%Y-%m-%d"))
-        log.info(f"Revenue: {revenue}  |  ASINs: {len(asin_traffic)}")
+        sp_results = sp_pull_days_fanout(sp_days)
+
+        # Primary day: grab revenue for today's daily_data row
+        target_str = target.strftime("%Y-%m-%d")
+        if target_str in sp_results:
+            revenue, asin_traffic = sp_results[target_str]
+        log.info(f"Revenue: {revenue}  |  ASINs (today): {len(asin_traffic)}")
+
+        # Upsert ASIN data for ALL returned days (refreshes delayed traffic data)
+        for date_str, (_, day_asin) in sp_results.items():
+            if not day_asin:
+                continue
+            supabase_upsert("asin_daily_data", [
+                {
+                    "date":                  date_str,
+                    "asin":                  asin,
+                    "brand":                 brand,
+                    "parent_asin":           m.get("parent_asin"),
+                    "sessions":              m.get("sessions"),
+                    "page_views":            m.get("page_views"),
+                    "units_ordered":         m.get("units_ordered"),
+                    "ordered_product_sales": m.get("ordered_product_sales"),
+                    "unit_session_pct":      m.get("unit_session_pct"),
+                    "buy_box_pct":           m.get("buy_box_pct"),
+                }
+                for asin, m in day_asin.items()
+            ])
     except Exception as exc:
         log.error(f"SP-API failed: {exc}")
 
-    # Ads API: PPC spend
+    # Ads API: PPC spend (target day only)
     spend: float | None = None
     try:
         spend_map = ads_pull_range(target, target)
@@ -587,31 +699,13 @@ def pull_day(target: date, brand: str) -> None:
     except Exception as exc:
         log.error(f"Ads API failed: {exc}")
 
-    # Upsert daily_data (Amazon columns only — CSV channels untouched)
+    # Upsert daily_data for target day (Amazon columns only — CSV channels untouched)
     supabase_upsert("daily_data", [{
         "date":             target.strftime("%Y-%m-%d"),
         "brand":            brand,
         "amazon_revenue":   revenue,
         "amazon_ppc_spend": spend,
     }])
-
-    # Upsert asin_daily_data
-    if asin_traffic:
-        supabase_upsert("asin_daily_data", [
-            {
-                "date":                  target.strftime("%Y-%m-%d"),
-                "asin":                  asin,
-                "brand":                 brand,
-                "parent_asin":           m.get("parent_asin"),
-                "sessions":              m.get("sessions"),
-                "page_views":            m.get("page_views"),
-                "units_ordered":         m.get("units_ordered"),
-                "ordered_product_sales": m.get("ordered_product_sales"),
-                "unit_session_pct":      m.get("unit_session_pct"),
-                "buy_box_pct":           m.get("buy_box_pct"),
-            }
-            for asin, m in asin_traffic.items()
-        ])
 
     print(f"\n  ✓ {target}  Revenue: {'${:,.2f}'.format(revenue) if revenue is not None else 'n/a'}  "
           f"PPC: {'${:,.2f}'.format(spend) if spend is not None else 'n/a'}  "
