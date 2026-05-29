@@ -637,6 +637,92 @@ def auto_backfill_gaps(brand: str, lookback_days: int = 30) -> None:
             log.error(f"  Backfill of {gs}→{ge} failed: {exc}")
 
 
+def find_ppc_gaps(start: date, end: date, brand: str) -> list[tuple[date, date]]:
+    """
+    Find dates where amazon_revenue is present but amazon_ppc_spend is NULL.
+    These are days where SP-API succeeded but the Ads API failed or timed out.
+    Returns grouped (gap_start, gap_end) ranges.
+    """
+    resp = requests.get(
+        f"{SUPABASE_URL}/rest/v1/daily_data",
+        headers={
+            "apikey":        SERVICE_KEY,
+            "Authorization": f"Bearer {SERVICE_KEY}",
+        },
+        params=[
+            ("select",              "date"),
+            ("brand",               f"eq.{brand}"),
+            ("date",                f"gte.{start}"),
+            ("date",                f"lte.{end}"),
+            ("amazon_revenue",      "not.is.null"),   # revenue exists
+            ("amazon_ppc_spend",    "is.null"),        # but PPC is missing
+        ],
+        timeout=30,
+    )
+    resp.raise_for_status()
+    missing = sorted(r["date"] for r in resp.json())
+    if not missing:
+        return []
+
+    ranges: list[tuple[date, date]] = []
+    gap_start = gap_end = date.fromisoformat(missing[0])
+    for ds in missing[1:]:
+        d = date.fromisoformat(ds)
+        if d == gap_end + timedelta(days=1):
+            gap_end = d
+        else:
+            ranges.append((gap_start, gap_end))
+            gap_start = gap_end = d
+    ranges.append((gap_start, gap_end))
+    return ranges
+
+
+def auto_backfill_ppc_gaps(brand: str, lookback_days: int = 30) -> None:
+    """
+    Re-pull Ads API spend for any day in the last N days where revenue is
+    present but amazon_ppc_spend is NULL. This catches days where the Ads API
+    timed out or hit a 429 while SP-API succeeded.
+    Only upserts the ppc_spend column — revenue and CSV channels are untouched.
+    """
+    today = date.today()
+    end   = today - timedelta(days=1)
+    start = today - timedelta(days=lookback_days)
+
+    log.info(f"PPC gap scan: checking [{start} → {end}] for missing spend data…")
+    try:
+        gaps = find_ppc_gaps(start, end, brand)
+    except Exception as exc:
+        log.warning(f"PPC gap scan failed: {exc} — skipping")
+        return
+
+    if not gaps:
+        log.info("  No PPC gaps found ✓")
+        return
+
+    total = sum((ge - gs).days + 1 for gs, ge in gaps)
+    log.info(f"  Found {total} day(s) with missing PPC across {len(gaps)} gap(s):")
+    for gs, ge in gaps:
+        log.info(f"    {gs} → {ge}")
+
+    for gs, ge in gaps:
+        log.info(f"Re-pulling Ads API for {gs} → {ge}…")
+        try:
+            all_spend = ads_pull_range(gs, ge)
+            rows = [
+                {"date": target.strftime("%Y-%m-%d"), "brand": brand,
+                 "amazon_ppc_spend": all_spend[target.strftime("%Y-%m-%d")]}
+                for target in date_range(gs, ge)
+                if target.strftime("%Y-%m-%d") in all_spend
+            ]
+            if rows:
+                supabase_upsert("daily_data", rows)
+                log.info(f"  ✓ Filled PPC for {len(rows)} day(s)")
+            else:
+                log.info(f"  Ads API returned no spend data for {gs}→{ge} — skipping")
+        except Exception as exc:
+            log.error(f"  Ads API re-pull failed for {gs}→{ge}: {exc}")
+
+
 # ── Orchestration ──────────────────────────────────────────────────────────────
 
 def pull_day(target: date, brand: str) -> None:
@@ -782,7 +868,8 @@ def main() -> None:
         pull_day(date.fromisoformat(args.date), args.brand)
     else:
         # Default cron mode: scan for gaps first, then pull yesterday
-        auto_backfill_gaps(args.brand, lookback_days=30)
+        auto_backfill_gaps(args.brand, lookback_days=30)        # missing days entirely
+        auto_backfill_ppc_gaps(args.brand, lookback_days=30)    # days with revenue but no PPC
         pull_day(date.today() - timedelta(days=1), args.brand)
 
 
