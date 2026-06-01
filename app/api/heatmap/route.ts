@@ -1,5 +1,5 @@
-import { createClient } from '@/lib/supabase/server'
-import { NextResponse }  from 'next/server'
+import { createAdminClient } from '@/lib/supabase/server'
+import { NextResponse }       from 'next/server'
 
 // GET /api/heatmap?days=90&brand=xpro
 export async function GET(request: Request) {
@@ -11,7 +11,9 @@ export async function GET(request: Request) {
   since.setDate(since.getDate() - days)
   const sinceStr = since.toISOString().slice(0, 10)
 
-  const supabase = await createClient()
+  // Use the admin client so RLS doesn't silently filter out rows when the
+  // caller is in the `authenticated` role (the anon RLS policy doesn't apply).
+  const supabase = createAdminClient()
   const { data, error } = await supabase
     .from('hourly_sales')
     .select('date, hour, order_count, units, revenue')
