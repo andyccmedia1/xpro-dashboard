@@ -35,6 +35,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from datetime import date, timedelta, datetime as _dt
 from zoneinfo import ZoneInfo
 
@@ -557,6 +558,7 @@ def orders_pull_range(start: date, end: date, brand: str) -> None:
                 resp = api.get_orders(
                     CreatedAfter=(start.isoformat() + "T00:00:00Z"),
                     CreatedBefore=((end + timedelta(days=1)).isoformat() + "T00:00:00Z"),
+                    MarketplaceIds=[SP_MARKETPLACE_ID],
                     OrderStatuses=["Shipped", "Unshipped", "PartiallyShipped", "Pending"],
                     MaxResultsPerPage=100,
                 )
@@ -605,7 +607,8 @@ def orders_pull_range(start: date, end: date, brand: str) -> None:
                 break
 
         except Exception as exc:
-            log.error(f"  Orders API error on page {page}: {exc}")
+            log.error(f"  Orders API error on page {page}: {type(exc).__name__}: {exc}")
+            log.error(traceback.format_exc())
             break
 
     if not buckets:
