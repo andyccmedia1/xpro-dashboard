@@ -723,13 +723,125 @@ def auto_backfill_ppc_gaps(brand: str, lookback_days: int = 30) -> None:
             log.error(f"  Ads API re-pull failed for {gs}→{ge}: {exc}")
 
 
+def find_asin_session_gaps(start: date, end: date, brand: str) -> list[date]:
+    """
+    Find dates (>= 4 days old) where asin_daily_data rows exist but all sessions = 0.
+    This means Amazon's traffic data wasn't available when the day was originally
+    pulled and still hasn't been refreshed.
+
+    Strategy: query for dates that have at least one session > 0 (data is good),
+    then compare against all dates that have any ASIN rows — the difference is
+    dates where every ASIN shows 0 sessions.
+    """
+    # Only check dates old enough for Amazon to have finalised traffic data
+    finalized_end = min(end, date.today() - timedelta(days=4))
+    if start > finalized_end:
+        return []
+
+    headers = {
+        "apikey":        SERVICE_KEY,
+        "Authorization": f"Bearer {SERVICE_KEY}",
+    }
+
+    # Dates that have at least one ASIN with sessions > 0 (traffic IS available)
+    r1 = requests.get(
+        f"{SUPABASE_URL}/rest/v1/asin_daily_data",
+        headers=headers,
+        params=[
+            ("select",   "date"),
+            ("brand",    f"eq.{brand}"),
+            ("date",     f"gte.{start}"),
+            ("date",     f"lte.{finalized_end}"),
+            ("sessions", "gt.0"),
+            ("limit",    "10000"),
+        ],
+        timeout=30,
+    )
+    r1.raise_for_status()
+    dates_ok = set(r["date"] for r in r1.json())
+
+    # All dates that have any ASIN rows at all
+    r2 = requests.get(
+        f"{SUPABASE_URL}/rest/v1/asin_daily_data",
+        headers=headers,
+        params=[
+            ("select", "date"),
+            ("brand",  f"eq.{brand}"),
+            ("date",   f"gte.{start}"),
+            ("date",   f"lte.{finalized_end}"),
+            ("limit",  "10000"),
+        ],
+        timeout=30,
+    )
+    r2.raise_for_status()
+    dates_all = set(r["date"] for r in r2.json())
+
+    # Dates where every ASIN has sessions = 0
+    gaps = sorted(dates_all - dates_ok)
+    return [date.fromisoformat(d) for d in gaps]
+
+
+def auto_refresh_asin_sessions(brand: str, lookback_days: int = 30) -> None:
+    """
+    Re-pull SP-API ASIN data for any date (4–30 days old) where sessions are
+    all 0, meaning Amazon's traffic data wasn't available at original pull time.
+    Uses fan-out: all gap dates are submitted simultaneously and polled together.
+    """
+    today = date.today()
+    end   = today - timedelta(days=1)
+    start = today - timedelta(days=lookback_days)
+
+    log.info(f"ASIN session gap scan: checking [{start} → {end}] (finalized dates only)…")
+    try:
+        gap_dates = find_asin_session_gaps(start, end, brand)
+    except Exception as exc:
+        log.warning(f"ASIN session gap scan failed: {exc} — skipping")
+        return
+
+    if not gap_dates:
+        log.info("  No ASIN session gaps found ✓")
+        return
+
+    log.info(f"  Found {len(gap_dates)} date(s) with zero sessions: {[str(d) for d in gap_dates]}")
+    log.info("  Submitting SP-API reports for all gap dates (fan-out)…")
+
+    try:
+        sp_results = sp_pull_days_fanout(gap_dates)
+        for date_str, (_, asin_data) in sp_results.items():
+            if not asin_data:
+                log.info(f"  No ASIN data returned for {date_str} — skipping")
+                continue
+            # Only upsert if at least one ASIN now has sessions > 0
+            if not any(m.get("sessions") for m in asin_data.values()):
+                log.info(f"  {date_str}: sessions still 0 — Amazon data may still not be ready")
+                continue
+            supabase_upsert("asin_daily_data", [
+                {
+                    "date":                  date_str,
+                    "asin":                  asin,
+                    "brand":                 brand,
+                    "parent_asin":           m.get("parent_asin"),
+                    "sessions":              m.get("sessions"),
+                    "page_views":            m.get("page_views"),
+                    "units_ordered":         m.get("units_ordered"),
+                    "ordered_product_sales": m.get("ordered_product_sales"),
+                    "unit_session_pct":      m.get("unit_session_pct"),
+                    "buy_box_pct":           m.get("buy_box_pct"),
+                }
+                for asin, m in asin_data.items()
+            ])
+            log.info(f"  ✓ Refreshed ASIN sessions for {date_str}: {len(asin_data)} ASINs")
+    except Exception as exc:
+        log.error(f"  ASIN session refresh failed: {exc}")
+
+
 # ── Orchestration ──────────────────────────────────────────────────────────────
 
 def pull_day(target: date, brand: str) -> None:
     """
     Single day pull — revenue + ASIN traffic + PPC spend.
 
-    SP-API reports are requested for the last 3 days simultaneously (fan-out)
+    SP-API reports are requested for the last 5 days simultaneously (fan-out)
     so that delayed ASIN traffic data (sessions, CVR, Buy Box %) is refreshed
     once Amazon finalises it. Amazon typically takes 2-4 days to publish
     accurate session counts — pulling only yesterday leaves recent rows at 0.
@@ -738,10 +850,11 @@ def pull_day(target: date, brand: str) -> None:
     log.info(f"DAILY PULL: {target}  (brand: {brand})")
     log.info(f"{'='*60}")
 
-    # SP-API: fan-out last 3 days so delayed session/CVR data gets refreshed
-    # day-1 = target (revenue + fresh ASIN), day-2 and day-3 = ASIN refresh only
-    sp_days = [target - timedelta(days=i) for i in range(3)]
-    log.info(f"SP-API: submitting reports for {sp_days[-1]} → {sp_days[0]} (3 days)…")
+    # SP-API: fan-out last 5 days so delayed session/CVR data gets refreshed.
+    # Amazon takes up to 4 days to finalise ASIN traffic — 5-day window gives buffer.
+    # All reports submitted simultaneously; poll together — no extra wall-clock time.
+    sp_days = [target - timedelta(days=i) for i in range(5)]
+    log.info(f"SP-API: submitting reports for {sp_days[-1]} → {sp_days[0]} (5 days)…")
 
     revenue: float | None = None
     asin_traffic: dict[str, dict] = {}
@@ -870,6 +983,7 @@ def main() -> None:
         # Default cron mode: scan for gaps first, then pull yesterday
         auto_backfill_gaps(args.brand, lookback_days=30)        # missing days entirely
         auto_backfill_ppc_gaps(args.brand, lookback_days=30)    # days with revenue but no PPC
+        auto_refresh_asin_sessions(args.brand, lookback_days=30) # days with sessions=0 (delayed traffic)
         pull_day(date.today() - timedelta(days=1), args.brand)
 
 
