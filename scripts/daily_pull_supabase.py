@@ -35,11 +35,12 @@ import logging
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime as _dt
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from sp_api.api import Reports
+from sp_api.api import Reports, Orders as SpOrders
 from sp_api.base import Marketplaces
 
 load_dotenv()
@@ -76,6 +77,9 @@ ADS_PROFILE_ID    = _require("AMAZON_ADS_PROFILE_ID")
 SUPABASE_URL = _require("SUPABASE_URL").rstrip("/")
 SERVICE_KEY  = _require("SUPABASE_SERVICE_ROLE_KEY")
 ACTIVE_BRAND = os.getenv("ACTIVE_BRAND", "xpro")
+
+# Seller's local timezone for hourly bucketing (Orders API timestamps are UTC)
+_SELLER_TZ = ZoneInfo(os.getenv("SELLER_TIMEZONE", "America/New_York"))
 
 _ADS_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
 _ADS_BASE_URL  = "https://advertising-api.amazon.com"
@@ -520,6 +524,110 @@ def _ads_parse(url: str) -> dict[str, float]:
     return daily
 
 
+# ── Orders API (hourly heatmap) ────────────────────────────────────────────────
+
+def orders_pull_range(start: date, end: date, brand: str) -> None:
+    """
+    Pull orders via SP-API Orders endpoint, bucket by (date, hour) in the seller's
+    local timezone (_SELLER_TZ), and upsert to the hourly_sales table.
+
+    Rate limits: getOrders = 0.0167 req/sec, burst 20.
+    Pages 1-20 have a 2s gap (within burst); beyond page 20, 65s gap.
+    For a typical daily pull (1-2 days) this is 1-5 pages — completes in <15 s.
+    For a 90-day backfill it can take 30-90 minutes depending on order volume.
+    """
+    api = SpOrders(credentials=SP_CREDS, marketplace=Marketplaces.US)
+
+    # {(date_str, hour): {order_count, units, revenue}}
+    buckets: dict[tuple[str, int], dict] = {}
+    next_token: str | None = None
+    page = 0
+
+    log.info(f"Orders API: pulling {start} → {end} (tz={_SELLER_TZ})…")
+
+    while True:
+        page += 1
+        if page > 1:
+            time.sleep(65 if page > 20 else 2)
+
+        try:
+            if next_token:
+                resp = api.get_orders(NextToken=next_token)
+            else:
+                resp = api.get_orders(
+                    CreatedAfter=(start.isoformat() + "T00:00:00Z"),
+                    CreatedBefore=((end + timedelta(days=1)).isoformat() + "T00:00:00Z"),
+                    OrderStatuses=["Shipped", "Unshipped", "PartiallyShipped", "Pending"],
+                    MaxResultsPerPage=100,
+                )
+
+            orders = resp.payload.get("Orders", [])
+            log.info(f"  Orders page {page}: {len(orders)} orders")
+
+            for order in orders:
+                purchase_str = order.get("PurchaseDate", "")
+                if not purchase_str:
+                    continue
+
+                try:
+                    utc_dt   = _dt.fromisoformat(purchase_str.replace("Z", "+00:00"))
+                    local_dt = utc_dt.astimezone(_SELLER_TZ)
+                    date_str = local_dt.strftime("%Y-%m-%d")
+                    hour     = local_dt.hour
+                except Exception:
+                    continue
+
+                d = date.fromisoformat(date_str)
+                if d < start or d > end:
+                    continue
+
+                # Order total (may be absent on Pending orders)
+                amount = 0.0
+                try:
+                    raw = (order.get("OrderTotal") or {}).get("Amount", 0)
+                    amount = float(raw or 0)
+                except (ValueError, TypeError):
+                    pass
+
+                shipped   = int(order.get("NumberOfItemsShipped")   or 0)
+                unshipped = int(order.get("NumberOfItemsUnshipped") or 0)
+                units     = max(shipped + unshipped, 1)
+
+                key = (date_str, hour)
+                if key not in buckets:
+                    buckets[key] = {"order_count": 0, "units": 0, "revenue": 0.0}
+                buckets[key]["order_count"] += 1
+                buckets[key]["units"]       += units
+                buckets[key]["revenue"]     += amount
+
+            next_token = resp.payload.get("NextToken")
+            if not next_token:
+                break
+
+        except Exception as exc:
+            log.error(f"  Orders API error on page {page}: {exc}")
+            break
+
+    if not buckets:
+        log.info("  No orders found in range")
+        return
+
+    rows = [
+        {
+            "date":        ds,
+            "hour":        h,
+            "brand":       brand,
+            "order_count": v["order_count"],
+            "units":       v["units"],
+            "revenue":     round(v["revenue"], 2),
+        }
+        for (ds, h), v in buckets.items()
+    ]
+    supabase_upsert("hourly_sales", rows)
+    days_covered = len({ds for ds, _ in buckets})
+    log.info(f"✓ Orders: {len(rows)} hourly buckets across {days_covered} day(s)")
+
+
 # ── Supabase ───────────────────────────────────────────────────────────────────
 
 def _sb_headers() -> dict:
@@ -906,6 +1014,12 @@ def pull_day(target: date, brand: str) -> None:
         "amazon_ppc_spend": spend,
     }])
 
+    # Orders API: bucket by hour for heatmap (target day only — fast, 1-3 pages)
+    try:
+        orders_pull_range(target, target, brand)
+    except Exception as exc:
+        log.error(f"Orders API failed: {exc}")
+
     print(f"\n  ✓ {target}  Revenue: {'${:,.2f}'.format(revenue) if revenue is not None else 'n/a'}  "
           f"PPC: {'${:,.2f}'.format(spend) if spend is not None else 'n/a'}  "
           f"ASINs: {len(asin_traffic)}\n")
@@ -951,6 +1065,13 @@ def backfill_range(start: date, end: date, brand: str) -> None:
         })
 
     supabase_upsert("daily_data", rows)
+
+    # Orders: pull full range for heatmap data (paginated, may take a while for long ranges)
+    try:
+        log.info("Pulling Orders API for heatmap data (this may take a few minutes)…")
+        orders_pull_range(start, end, brand)
+    except Exception as exc:
+        log.error(f"Orders API range pull failed: {exc}")
 
     # Summary
     got_rev   = sum(1 for r in rows if r["amazon_revenue"]   is not None)
