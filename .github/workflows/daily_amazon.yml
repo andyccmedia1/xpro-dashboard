@@ -22,6 +22,11 @@ on:
         description: 'Backfill end date (YYYY-MM-DD). Use with start_date.'
         required: false
         default: ''
+      orders_only:
+        description: 'Orders API only — populate heatmap (hourly_sales) without re-running SP-API or Ads API. Check this for a fast heatmap-only pull.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   pull:
@@ -43,12 +48,18 @@ jobs:
 
       - name: Pull Amazon data
         run: |
+          # Build base command — add --orders-only flag when checkbox is checked
+          CMD="python scripts/daily_pull_supabase.py"
+          if [ "${{ github.event.inputs.orders_only }}" = "true" ]; then
+            CMD="$CMD --orders-only"
+          fi
+
           if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
-            python scripts/daily_pull_supabase.py --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
+            $CMD --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
           elif [ -n "${{ github.event.inputs.date }}" ]; then
-            python scripts/daily_pull_supabase.py --date "${{ github.event.inputs.date }}"
+            $CMD --date "${{ github.event.inputs.date }}"
           else
-            python scripts/daily_pull_supabase.py
+            $CMD
           fi
         env:
           # ── SP-API ─────────────────────────────────────────────────────────

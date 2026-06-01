@@ -14,10 +14,18 @@ BACKFILL MODE (--start / --end):
     instead of 18+ hours. ASIN per-day data is skipped in backfill mode
     (daily pulls going forward will populate it).
 
+ORDERS-ONLY MODE (--orders-only):
+    Skips SP-API reports and Ads API completely — only pulls the Orders API
+    to populate the hourly_sales heatmap table. Much faster (~1–5 min).
+    Combine with --start/--end to backfill historical heatmap data, or with
+    --date for a single day, or leave blank for yesterday.
+
 Usage:
     python scripts/daily_pull_supabase.py                            # yesterday + auto-gap-fill
     python scripts/daily_pull_supabase.py --date 2026-05-20         # single day (no gap scan)
     python scripts/daily_pull_supabase.py --start 2026-01-01 --end 2026-05-24  # backfill
+    python scripts/daily_pull_supabase.py --orders-only             # heatmap only, yesterday
+    python scripts/daily_pull_supabase.py --orders-only --start 2026-03-01 --end 2026-05-31  # heatmap backfill
 
 Required env vars:
     AMAZON_SP_CLIENT_ID, AMAZON_SP_CLIENT_SECRET, AMAZON_SP_REFRESH_TOKEN
@@ -1088,12 +1096,34 @@ def backfill_range(start: date, end: date, brand: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pull Amazon data into Supabase")
-    parser.add_argument("--date",  help="Single date YYYY-MM-DD (default: yesterday)")
-    parser.add_argument("--start", help="Backfill start date YYYY-MM-DD")
-    parser.add_argument("--end",   help="Backfill end date YYYY-MM-DD")
-    parser.add_argument("--brand", default=ACTIVE_BRAND)
+    parser.add_argument("--date",        help="Single date YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--start",       help="Backfill start date YYYY-MM-DD")
+    parser.add_argument("--end",         help="Backfill end date YYYY-MM-DD")
+    parser.add_argument("--brand",       default=ACTIVE_BRAND)
+    parser.add_argument("--orders-only", action="store_true",
+                        help="Pull Orders API only (hourly_sales heatmap). Skip SP-API + Ads API.")
     args = parser.parse_args()
 
+    # ── Orders-only mode ────────────────────────────────────────────────────────
+    if args.orders_only:
+        if args.start and args.end:
+            log.info("Orders-only backfill mode")
+            orders_pull_range(
+                date.fromisoformat(args.start),
+                date.fromisoformat(args.end),
+                args.brand,
+            )
+        elif args.date:
+            d = date.fromisoformat(args.date)
+            log.info(f"Orders-only single-day mode: {d}")
+            orders_pull_range(d, d, args.brand)
+        else:
+            yesterday = date.today() - timedelta(days=1)
+            log.info(f"Orders-only mode: pulling yesterday ({yesterday})")
+            orders_pull_range(yesterday, yesterday, args.brand)
+        return
+
+    # ── Full pull modes ─────────────────────────────────────────────────────────
     if args.start and args.end:
         backfill_range(
             date.fromisoformat(args.start),
@@ -1105,8 +1135,8 @@ def main() -> None:
         pull_day(date.fromisoformat(args.date), args.brand)
     else:
         # Default cron mode: scan for gaps first, then pull yesterday
-        auto_backfill_gaps(args.brand, lookback_days=30)        # missing days entirely
-        auto_backfill_ppc_gaps(args.brand, lookback_days=30)    # days with revenue but no PPC
+        auto_backfill_gaps(args.brand, lookback_days=30)         # missing days entirely
+        auto_backfill_ppc_gaps(args.brand, lookback_days=30)     # days with revenue but no PPC
         auto_refresh_asin_sessions(args.brand, lookback_days=30) # days with sessions=0 (delayed traffic)
         pull_day(date.today() - timedelta(days=1), args.brand)
 
