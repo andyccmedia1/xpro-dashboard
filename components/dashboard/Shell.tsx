@@ -8,6 +8,7 @@ import Channels        from '@/components/dashboard/tabs/Channels'
 import SkuPerformance  from '@/components/dashboard/tabs/SkuPerformance'
 import DataManager     from '@/components/dashboard/tabs/DataManager'
 import Heatmap         from '@/components/dashboard/tabs/Heatmap'
+import BudgetAllocator from '@/components/dashboard/tabs/BudgetAllocator'
 
 const TABS = [
   { id: 'overview',  label: 'Overview' },
@@ -15,6 +16,7 @@ const TABS = [
   { id: 'levers',    label: 'Lever Analysis' },
   { id: 'skus',      label: 'SKU Performance' },
   { id: 'heatmap',   label: 'Sales Heatmap' },
+  { id: 'budget',    label: 'Budget Allocator' },
   { id: 'data',      label: 'Data Manager' },
 ]
 
@@ -116,6 +118,7 @@ export default function DashboardShell({ userEmail }: { userEmail: string }) {
         {activeTab === 'levers'   && <LeverAnalysis start={dates.start} end={dates.end} />}
         {activeTab === 'skus'     && <SkuPerformance start={dates.start} end={dates.end} />}
         {activeTab === 'heatmap'  && <Heatmap />}
+        {activeTab === 'budget'   && <BudgetAllocator />}
         {activeTab === 'data'     && <DataManager />}
       </main>
     </div>
