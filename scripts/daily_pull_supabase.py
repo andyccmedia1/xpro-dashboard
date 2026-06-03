@@ -102,6 +102,19 @@ _AD_TYPES = [
     {"adProduct": "SPONSORED_DISPLAY",  "reportTypeId": "sdCampaigns", "label": "SD"},
 ]
 
+# Per-campaign report columns. Metric names differ across SP / SB / SD, so each
+# ad product gets its own column list to avoid "invalid column" report failures.
+# Only SP reliably exposes campaignBudgetAmount — used to detect budget-capped
+# campaigns. SB/SD store cost + sales (budget left null).
+_CAMPAIGN_COLUMNS = {
+    "SP": ["date", "campaignId", "campaignName", "campaignBudgetAmount",
+           "impressions", "clicks", "cost", "purchases7d", "sales7d"],
+    "SB": ["date", "campaignId", "campaignName",
+           "impressions", "clicks", "cost", "purchases", "sales"],
+    "SD": ["date", "campaignId", "campaignName",
+           "impressions", "clicks", "cost", "purchases", "sales"],
+}
+
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 
@@ -433,8 +446,13 @@ def ads_pull_range(start: date, end: date) -> dict[str, float]:
 
 
 def _ads_request_with_retry(headers: dict, start: date, end: date, ad_type: dict,
-                             max_retries: int = 4) -> str:
-    """Submit an Ads API report request, retrying on 429 with exponential backoff."""
+                             max_retries: int = 4, submit_fn=None) -> str:
+    """
+    Submit an Ads API report request, retrying on 429 with exponential backoff.
+    submit_fn lets callers choose which report shape to request (default = the
+    daily-totals report; pass _ads_request_campaign_report for per-campaign data).
+    """
+    submit_fn = submit_fn or _ads_request_report
     backoff = [30, 60, 120, 240]
     for attempt in range(max_retries + 1):
         if attempt > 0:
@@ -442,7 +460,7 @@ def _ads_request_with_retry(headers: dict, start: date, end: date, ad_type: dict
             log.info(f"  Retry {attempt}/{max_retries} for {ad_type['label']}, waiting {wait}s…")
             time.sleep(wait)
         try:
-            return _ads_request_report(headers, start, end, ad_type)
+            return submit_fn(headers, start, end, ad_type)
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 429 and attempt < max_retries:
                 log.warning(f"  429 on {ad_type['label']} submission — will retry")
@@ -531,6 +549,155 @@ def _ads_parse(url: str) -> dict[str, float]:
         if day:
             daily[day] = daily.get(day, 0.0) + cost
     return daily
+
+
+# ── Ads API: per-campaign performance (budget allocation) ──────────────────────
+
+def _ads_request_campaign_report(headers: dict, start: date, end: date, ad_type: dict) -> str:
+    """Submit a per-campaign report (richer columns than the daily-totals report)."""
+    resp = requests.post(
+        f"{_ADS_BASE_URL}/reporting/reports",
+        headers=headers,
+        json={
+            "name":      f"Campaign {ad_type['label']} {start} to {end}",
+            "startDate": start.strftime("%Y-%m-%d"),
+            "endDate":   end.strftime("%Y-%m-%d"),
+            "configuration": {
+                "adProduct":    ad_type["adProduct"],
+                "groupBy":      ["campaign"],
+                "columns":      _CAMPAIGN_COLUMNS[ad_type["label"]],
+                "reportTypeId": ad_type["reportTypeId"],
+                "timeUnit":     "DAILY",
+                "format":       "GZIP_JSON",
+            },
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        log.error(f"Campaign report request {resp.status_code}: {resp.text[:300]}")
+    resp.raise_for_status()
+    return resp.json()["reportId"]
+
+
+def _ads_parse_campaigns(url: str, ad_label: str, brand: str) -> list[dict]:
+    """Parse a per-campaign report into campaign_daily rows."""
+    raw     = requests.get(url, timeout=120).content
+    records = json.loads(gzip.decompress(raw).decode("utf-8"))
+    out: list[dict] = []
+    for rec in records:
+        day = (rec.get("date") or "").strip()
+        cid = rec.get("campaignId")
+        if not day or cid is None:
+            continue
+        # SP uses 7-day attribution columns; SB/SD use undated ones
+        sales  = rec.get("sales7d",     rec.get("sales"))
+        orders = rec.get("purchases7d", rec.get("purchases"))
+        out.append({
+            "date":          day,
+            "brand":         brand,
+            "campaign_id":   str(cid),
+            "ad_product":    ad_label,
+            "campaign_name": rec.get("campaignName"),
+            "budget":        _to_float(rec.get("campaignBudgetAmount")),
+            "impressions":   _to_int(rec.get("impressions")),
+            "clicks":        _to_int(rec.get("clicks")),
+            "cost":          _to_float(rec.get("cost")),
+            "orders":        _to_int(orders),
+            "sales":         _to_float(sales),
+        })
+    return out
+
+
+def ads_pull_campaigns_range(start: date, end: date, brand: str) -> None:
+    """
+    Pull PER-CAMPAIGN performance (spend, sales, orders, budget) for [start, end]
+    across SP/SB/SD and upsert to campaign_daily. Powers the budget-allocation view.
+
+    READ-ONLY: this only stores data for analysis. It does NOT modify any Amazon
+    budgets or campaigns. Same fan-out submit-then-poll pattern as ads_pull_range.
+    """
+    token   = _ads_token()
+    headers = _ads_headers(token)
+    retention_cutoff = date.today() - timedelta(days=_SB_SD_RETENTION_DAYS)
+    chunks  = list(chunk_dates(start, end, _ADS_CHUNK_DAYS))
+
+    # ── Step 1: submit all per-campaign reports upfront ────────
+    pending: list[tuple[str, str, str]] = []   # (report_id, label, desc)
+    for i, ad_type in enumerate(_AD_TYPES):
+        if i > 0:
+            log.info(f"Pausing 15s before submitting {ad_type['label']} campaign reports…")
+            time.sleep(15)
+        for cs, ce in chunks:
+            if ad_type["label"] in ("SB", "SD") and ce < retention_cutoff:
+                continue
+            eff_start = max(cs, retention_cutoff) if ad_type["label"] in ("SB", "SD") else cs
+            desc = f"{ad_type['label']} campaigns {eff_start}–{ce}"
+            try:
+                report_id = _ads_request_with_retry(
+                    headers, eff_start, ce, ad_type,
+                    submit_fn=_ads_request_campaign_report,
+                )
+                pending.append((report_id, ad_type["label"], desc))
+                log.info(f"  Submitted {desc}: {report_id}")
+            except Exception as exc:
+                log.warning(f"  Failed to submit {desc}: {exc}")
+
+    if not pending:
+        log.warning("No campaign reports submitted — skipping campaign_daily")
+        return
+
+    log.info(f"Submitted {len(pending)} campaign report(s). Polling (30-min timeout)…")
+
+    # ── Step 2: poll all reports together ──────────────────────
+    completed: list[tuple[str, str]] = []   # (url, label)
+    remaining = list(pending)
+    deadline  = time.time() + 1800
+    while remaining and time.time() < deadline:
+        time.sleep(30)
+        still_pending = []
+        for report_id, label, desc in remaining:
+            try:
+                resp = requests.get(
+                    f"{_ADS_BASE_URL}/reporting/reports/{report_id}",
+                    headers=headers, timeout=30,
+                )
+                resp.raise_for_status()
+                data   = resp.json()
+                status = data.get("status")
+                if status == "COMPLETED":
+                    completed.append((data["url"], label))
+                    log.info(f"  ✓ {desc} complete")
+                elif status in ("FAILURE", "CANCELLED"):
+                    log.warning(f"  ✗ {desc} failed: {status} — {data.get('statusDetails', '')}")
+                else:
+                    still_pending.append((report_id, label, desc))
+            except Exception as exc:
+                log.warning(f"  Poll error for {desc}: {exc}")
+                still_pending.append((report_id, label, desc))
+        remaining = still_pending
+        if remaining:
+            log.info(f"  Still waiting on {len(remaining)} campaign report(s)…")
+
+    if remaining:
+        log.warning(f"Campaign reports timed out: {[d for _, _, d in remaining]}")
+
+    # ── Step 3: parse + upsert ─────────────────────────────────
+    rows: list[dict] = []
+    for url, label in completed:
+        try:
+            parsed = _ads_parse_campaigns(url, label, brand)
+            rows.extend(parsed)
+            log.info(f"  Parsed {label}: {len(parsed)} campaign-day row(s)")
+        except Exception as exc:
+            log.warning(f"  Failed to parse {label} campaign report: {exc}")
+
+    if rows:
+        supabase_upsert("campaign_daily", rows)
+        days = len({r["date"] for r in rows})
+        camps = len({r["campaign_id"] for r in rows})
+        log.info(f"✓ Campaign data: {len(rows)} row(s), {camps} campaign(s) across {days} day(s)")
+    else:
+        log.info("  No campaign rows parsed")
 
 
 # ── Orders API (hourly heatmap) ────────────────────────────────────────────────
@@ -1031,6 +1198,12 @@ def pull_day(target: date, brand: str) -> None:
     except Exception as exc:
         log.error(f"Orders API failed: {exc}")
 
+    # Per-campaign performance for budget allocation (read-only analysis data)
+    try:
+        ads_pull_campaigns_range(target, target, brand)
+    except Exception as exc:
+        log.error(f"Campaign data pull failed: {exc}")
+
     print(f"\n  ✓ {target}  Revenue: {'${:,.2f}'.format(revenue) if revenue is not None else 'n/a'}  "
           f"PPC: {'${:,.2f}'.format(spend) if spend is not None else 'n/a'}  "
           f"ASINs: {len(asin_traffic)}\n")
@@ -1083,6 +1256,13 @@ def backfill_range(start: date, end: date, brand: str) -> None:
         orders_pull_range(start, end, brand)
     except Exception as exc:
         log.error(f"Orders API range pull failed: {exc}")
+
+    # Per-campaign performance for budget allocation (read-only analysis data)
+    try:
+        log.info("Pulling per-campaign performance for budget allocation…")
+        ads_pull_campaigns_range(start, end, brand)
+    except Exception as exc:
+        log.error(f"Campaign data range pull failed: {exc}")
 
     # Summary
     got_rev   = sum(1 for r in rows if r["amazon_revenue"]   is not None)
