@@ -116,8 +116,17 @@ export default function BudgetAllocator() {
     const starvedExtra = derived
       .filter(d => d.bucket === 'starved' && d.delta != null)
       .reduce((s, d) => s + (d.delta ?? 0), 0)
-    return { spend, sales, acos: sales > 0 ? spend / sales : null, starvedExtra }
-  }, [derived])
+    // Sum of per-campaign daily budgets = theoretical spend ceiling if you drop
+    // the account-level cap and let each campaign be limited only by its own budget.
+    const budgetCeiling = derived.reduce((s, d) => s + (d.current_budget ?? 0), 0)
+    // What you actually spend per day, averaged across the period.
+    const actualDaily = spend / periodDays
+    return {
+      spend, sales,
+      acos: sales > 0 ? spend / sales : null,
+      starvedExtra, budgetCeiling, actualDaily,
+    }
+  }, [derived, periodDays])
 
   const rows = filter === 'all' ? derived : derived.filter(d => d.bucket === filter)
 
@@ -178,10 +187,26 @@ export default function BudgetAllocator() {
         <>
           {/* ── Summary cards ─────────────────────────────────── */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <Card label="Spend"        value={usdExact(totals.spend)} sub={`${periodDays}d · ${derived.length} campaigns`} />
-            <Card label="Blended ACOS" value={pct(totals.acos)}       sub={`Target ${Math.round(targetAcos * 100)}%`} />
-            <Card label="Starved winners" value={String(counts.starved)} sub="Profitable but capped" accent="text-amber-400" />
-            <Card label="Suggested budget lift" value={`+${usdExact(totals.starvedExtra)}/day`} sub="Across starved winners" accent="text-amber-400" />
+            <Card label="Actual daily spend" value={`${usdExact(totals.actualDaily)}/day`} sub={`Avg over ${periodDays}d · what you really spend`} />
+            <Card label="Budget ceiling"     value={`${usdExact(totals.budgetCeiling)}/day`} sub="Sum of campaign budgets (max, not actual)" />
+            <Card label="Blended ACOS"        value={pct(totals.acos)} sub={`Target ${Math.round(targetAcos * 100)}%`} />
+            <Card label="Starved winners"     value={String(counts.starved)} sub="Profitable & capped" accent={counts.starved > 0 ? 'text-amber-400' : 'text-white'} />
+          </div>
+
+          {/* ── Account-cap insight ───────────────────────────── */}
+          <div className="bg-indigo-950/30 border border-indigo-800/40 rounded-xl p-4 text-sm text-indigo-200 space-y-1.5">
+            <p className="font-semibold text-white">If you drop the account-level cap</p>
+            <p>
+              Your spend ceiling becomes <span className="font-medium text-white">{usdExact(totals.budgetCeiling)}/day</span> (the sum of every
+              campaign’s own budget) — but that’s a <span className="italic">maximum</span>, not a prediction. You actually spend
+              about <span className="font-medium text-white">{usdExact(totals.actualDaily)}/day</span> right now, limited by your bids and demand.
+            </p>
+            <p>
+              Removing the cap lets spend rise from today’s level toward whatever profitable demand supports —
+              {counts.starved === 0
+                ? ' it won’t jump to the ceiling. With 0 campaigns hitting their own budgets, the account cap is the only thing throttling your afternoons.'
+                : ` and the ${counts.starved} starved winner(s) above are where that extra spend should go first.`}
+            </p>
           </div>
 
           {/* ── Bucket filter chips ───────────────────────────── */}
