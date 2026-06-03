@@ -1282,6 +1282,8 @@ def main() -> None:
     parser.add_argument("--brand",       default=ACTIVE_BRAND)
     parser.add_argument("--orders-only", action="store_true",
                         help="Pull Orders API only (hourly_sales heatmap). Skip SP-API + Ads API.")
+    parser.add_argument("--campaigns-only", action="store_true",
+                        help="Pull per-campaign Ads performance only (campaign_daily). Skip everything else.")
     args = parser.parse_args()
 
     # ── Orders-only mode ────────────────────────────────────────────────────────
@@ -1301,6 +1303,25 @@ def main() -> None:
             yesterday = date.today() - timedelta(days=1)
             log.info(f"Orders-only mode: pulling yesterday ({yesterday})")
             orders_pull_range(yesterday, yesterday, args.brand)
+        return
+
+    # ── Campaigns-only mode ─────────────────────────────────────────────────────
+    if args.campaigns_only:
+        if args.start and args.end:
+            log.info("Campaigns-only backfill mode")
+            ads_pull_campaigns_range(
+                date.fromisoformat(args.start),
+                date.fromisoformat(args.end),
+                args.brand,
+            )
+        elif args.date:
+            d = date.fromisoformat(args.date)
+            log.info(f"Campaigns-only single-day mode: {d}")
+            ads_pull_campaigns_range(d, d, args.brand)
+        else:
+            yesterday = date.today() - timedelta(days=1)
+            log.info(f"Campaigns-only mode: pulling yesterday ({yesterday})")
+            ads_pull_campaigns_range(yesterday, yesterday, args.brand)
         return
 
     # ── Full pull modes ─────────────────────────────────────────────────────────

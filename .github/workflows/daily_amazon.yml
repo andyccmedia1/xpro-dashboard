@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      campaigns_only:
+        description: 'Per-campaign Ads data only — populate campaign_daily (budget allocation) without re-running anything else.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   pull:
@@ -48,10 +53,13 @@ jobs:
 
       - name: Pull Amazon data
         run: |
-          # Build base command — add --orders-only flag when checkbox is checked
+          # Build base command — add a "-only" flag when its checkbox is checked
           CMD="python scripts/daily_pull_supabase.py"
           if [ "${{ github.event.inputs.orders_only }}" = "true" ]; then
             CMD="$CMD --orders-only"
+          fi
+          if [ "${{ github.event.inputs.campaigns_only }}" = "true" ]; then
+            CMD="$CMD --campaigns-only"
           fi
 
           if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
