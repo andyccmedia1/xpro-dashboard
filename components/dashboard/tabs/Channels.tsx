@@ -228,9 +228,12 @@ export default function Channels({ start, end, brand = 'xpro' }: Props) {
               <>
                 {[
                   { label: 'Amazon',  rev: ch?.revenue.amazon.total,  share: ch?.revenue.amazon.share,  spend: ch?.spend.amazon.total,  roas: ch?.spend.amazon.roas,  dot: CHANNEL_COLORS.amazon  },
-                  { label: 'Shopify', rev: ch?.revenue.shopify.total, share: ch?.revenue.shopify.share, spend: null,                    roas: null,                   dot: CHANNEL_COLORS.shopify },
+                  // Meta ad spend drives Shopify, so it's attributed here (ROAS = Shopify rev ÷ Meta spend)
+                  { label: 'Shopify', rev: ch?.revenue.shopify.total, share: ch?.revenue.shopify.share,
+                    spend: ch?.spend.meta.total,
+                    roas:  (ch?.revenue.shopify.total && ch?.spend.meta.total) ? ch.revenue.shopify.total / ch.spend.meta.total : null,
+                    dot: CHANNEL_COLORS.shopify },
                   { label: 'TikTok', rev: ch?.revenue.tiktok.total,  share: ch?.revenue.tiktok.share,  spend: ch?.spend.tiktok.total,  roas: ch?.spend.tiktok.roas,  dot: CHANNEL_COLORS.tiktok  },
-                  { label: 'Meta Ads (all channels)', rev: null, share: null, spend: ch?.spend.meta.total, roas: ch?.spend.meta.roas, dot: SPEND_COLORS.meta },
                 ].map(row => (
                   <tr key={row.label} className="hover:bg-gray-800/40 transition-colors">
                     <td className="px-6 py-3 flex items-center gap-2">
