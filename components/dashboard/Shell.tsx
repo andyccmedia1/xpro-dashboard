@@ -9,6 +9,7 @@ import SkuPerformance  from '@/components/dashboard/tabs/SkuPerformance'
 import DataManager     from '@/components/dashboard/tabs/DataManager'
 import Heatmap         from '@/components/dashboard/tabs/Heatmap'
 import BudgetAllocator from '@/components/dashboard/tabs/BudgetAllocator'
+import Inventory       from '@/components/dashboard/tabs/Inventory'
 
 const TABS = [
   { id: 'overview',  label: 'Overview' },
@@ -17,6 +18,7 @@ const TABS = [
   { id: 'skus',      label: 'SKU Performance' },
   { id: 'heatmap',   label: 'Sales Heatmap' },
   { id: 'budget',    label: 'Budget Allocator' },
+  { id: 'inventory', label: 'Inventory' },
   { id: 'data',      label: 'Data Manager' },
 ]
 
@@ -119,6 +121,7 @@ export default function DashboardShell({ userEmail }: { userEmail: string }) {
         {activeTab === 'skus'     && <SkuPerformance start={dates.start} end={dates.end} />}
         {activeTab === 'heatmap'  && <Heatmap />}
         {activeTab === 'budget'   && <BudgetAllocator />}
+        {activeTab === 'inventory'&& <Inventory />}
         {activeTab === 'data'     && <DataManager />}
       </main>
     </div>
