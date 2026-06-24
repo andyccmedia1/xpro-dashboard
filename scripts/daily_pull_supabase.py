@@ -96,6 +96,27 @@ _SP_CHUNK_DAYS = 30   # SP-API: request at most 30 days per report
 _ADS_CHUNK_DAYS = 30  # Ads API: maximum 30 days per report
 _SB_SD_RETENTION_DAYS = 59  # SB/SD data retention window
 
+# ── FBA Inventory Ledger (depletion forecasting) ───────────────────────────────
+# Event-type values in GET_LEDGER_DETAIL_VIEW_DATA that represent true customer
+# depletion of the FBA pool — Amazon-marketplace orders AND Shopify-via-MCF removals.
+# The exact string differs by report version ("Shipments" vs "CustomerShipments"), so we
+# match a normalised, CONFIGURABLE set (not a literal buried in logic) and log every
+# distinct event type seen on each run (see fetch_inventory_ledger). Everything else
+# (Receipts, CustomerReturns, Removals, Disposals, Adjustments, WarehouseTransfer, Found,
+# …) is NOT demand and is excluded.
+#
+# TODO(first-run verification — do not assume, the logs will tell you):
+#   1. EVENT TYPE: confirm which string actually appears (logged each run) and trim this set.
+#   2. MCF RECONCILIATION: confirm a known Shopify-via-MCF order's units show up here under
+#      customer shipments. This assumption is the whole basis of the feed — verify, then
+#      document the result in this comment.
+#   3. QUANTITY SIGN: shipments come through negative (depletion); we take abs(). Re-check
+#      if a future report version changes sign conventions.
+_LEDGER_SHIPMENT_EVENT_TYPES = {"Shipments", "CustomerShipments", "Customer Shipments"}
+_LEDGER_SHIPMENT_NORM  = {e.lower().replace(" ", "") for e in _LEDGER_SHIPMENT_EVENT_TYPES}
+_LEDGER_LOOKBACK_DAYS  = 95   # > 90 so the 90-day velocity window is always full
+_LEDGER_OVERWRITE_DAYS = 5    # re-pull/overwrite trailing N days each run (ledger reconciles)
+
 _AD_TYPES = [
     {"adProduct": "SPONSORED_PRODUCTS", "reportTypeId": "spCampaigns", "label": "SP"},
     {"adProduct": "SPONSORED_BRANDS",   "reportTypeId": "sbCampaigns", "label": "SB"},
@@ -835,6 +856,30 @@ def supabase_upsert(table: str, rows: list[dict]) -> None:
     log.info(f"✓ Upserted {len(rows)} row(s) → {table}")
 
 
+def supabase_delete_range(table: str, brand: str, start: date, end: date,
+                          date_col: str = "ship_date") -> None:
+    """
+    Delete rows for a brand within [start, end] inclusive. Used to overwrite a trailing
+    window before re-upserting, so reconciliation adjustments (and rows that should no
+    longer exist) are reflected and re-runs stay idempotent.
+
+    Always filtered by brand AND date — never issue an unfiltered DELETE.
+    """
+    resp = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        params=[
+            ("brand",  f"eq.{brand}"),
+            (date_col, f"gte.{start.isoformat()}"),
+            (date_col, f"lte.{end.isoformat()}"),
+        ],
+        timeout=60,
+    )
+    if not resp.ok:
+        log.error(f"Supabase delete {table} {resp.status_code}: {resp.text[:400]}")
+        resp.raise_for_status()
+
+
 # ── Gap detection ──────────────────────────────────────────────────────────────
 
 def get_existing_dates(start: date, end: date, brand: str) -> set[str]:
@@ -1121,6 +1166,171 @@ def auto_refresh_asin_sessions(brand: str, lookback_days: int = 30) -> None:
         log.error(f"  ASIN session refresh failed: {exc}")
 
 
+# ── FBA Inventory Ledger (depletion feed) ──────────────────────────────────────
+
+def _parse_ledger_date(raw: str) -> str | None:
+    """
+    Normalise a ledger 'Date' cell to ISO 'YYYY-MM-DD'. The flat file's date format is
+    locale-dependent, so try the common layouts. Returns None on an unparseable value.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y"):
+        try:
+            return _dt.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _ledger_header_index(headers: list[str], aliases: list[str], *, required: bool) -> int | None:
+    """
+    Find a column index by matching any of `aliases` (case-insensitive) against the TSV
+    header row. Fail LOUDLY if a required column is absent rather than silently producing
+    zeros — locale/version can shift or rename columns.
+    """
+    norm = [h.strip().lower() for h in headers]
+    for alias in aliases:
+        if alias in norm:
+            return norm.index(alias)
+    if required:
+        raise RuntimeError(
+            f"Inventory ledger TSV is missing a required column (looked for {aliases}). "
+            f"Headers present: {headers}"
+        )
+    return None
+
+
+def _parse_ledger_tsv(content: str, brand: str) -> tuple[list[dict], dict[str, int]]:
+    """
+    Parse a GET_LEDGER_DETAIL_VIEW_DATA TSV into fba_daily_shipped rows.
+
+    Maps columns by header name (Date / Event Type / MSKU / ASIN / Quantity), filters to
+    customer-shipment event types, and aggregates abs(qty) per (ship_date, msku, asin).
+    Returns (rows, event_type_counts); the counts are logged so the event filter can be
+    verified and locked on first run.
+    """
+    lines = content.split("\n")
+    if not lines or not lines[0].strip():
+        raise RuntimeError("Inventory ledger report was empty")
+
+    headers = lines[0].rstrip("\r").split("\t")
+    i_date  = _ledger_header_index(headers, ["date"], required=True)
+    i_event = _ledger_header_index(headers, ["event type", "eventtype"], required=True)
+    i_msku  = _ledger_header_index(headers, ["msku", "merchant sku", "merchantsku", "seller sku", "sku"], required=True)
+    i_qty   = _ledger_header_index(headers, ["quantity", "qty"], required=True)
+    i_asin  = _ledger_header_index(headers, ["asin"], required=False)
+    need    = max(i_date, i_event, i_msku, i_qty)
+
+    event_counts: dict[str, int] = {}
+    agg: dict[tuple[str, str, str | None], int] = {}
+
+    for line in lines[1:]:
+        line = line.rstrip("\r")
+        if not line.strip():
+            continue
+        cells = line.split("\t")
+        if len(cells) <= need:
+            continue
+
+        event = cells[i_event].strip()
+        event_counts[event] = event_counts.get(event, 0) + 1
+        # Customer shipments only — Amazon orders + MCF removals. Everything else skipped.
+        if event.lower().replace(" ", "") not in _LEDGER_SHIPMENT_NORM:
+            continue
+
+        ship_date = _parse_ledger_date(cells[i_date])
+        msku = cells[i_msku].strip()
+        if not ship_date or not msku:
+            continue
+
+        # Shipments are reported as negative quantities (depletion) — take abs().
+        try:
+            qty = abs(int(float(cells[i_qty].strip() or 0)))
+        except (ValueError, TypeError):
+            continue
+        if qty == 0:
+            continue
+
+        asin = None
+        if i_asin is not None and i_asin < len(cells):
+            asin = cells[i_asin].strip() or None
+
+        key = (ship_date, msku, asin)
+        agg[key] = agg.get(key, 0) + qty
+
+    rows = [
+        {"ship_date": d, "msku": m, "brand": brand, "asin": a, "units": u}
+        for (d, m, a), u in agg.items()
+    ]
+    return rows, event_counts
+
+
+def fetch_inventory_ledger(start: date, end: date, brand: str) -> None:
+    """
+    Pull the FBA Inventory Ledger (detailed view) for [start, end] and upsert per-SKU
+    customer-shipment units into fba_daily_shipped — the MCF-inclusive depletion signal
+    that drives replenishment forecasting.
+
+    Why the ledger and not asin_daily_data.units_ordered: units_ordered comes from
+    salesAndTrafficByAsin, which counts Amazon-marketplace orders ONLY. Shopify orders
+    fulfilled via Amazon MCF are not Amazon-marketplace orders, so they're invisible there.
+    The ledger's customer-shipment events capture Amazon orders AND MCF removals together —
+    the true draw-down of the FBA pool.
+
+    Reuses the existing SP-API auth/client (SP_CREDS) and Supabase REST helpers — no new
+    secrets, no second auth path. Scope is Amazon FBA "Pool 1" across all marketplaces in
+    AMAZON_MARKETPLACE_ID.
+
+    Idempotent: the trailing _LEDGER_OVERWRITE_DAYS days of the range are deleted and
+    re-inserted each run (the ledger keeps reconciling for several days); the rest is
+    upserted on the (ship_date, msku, brand) primary key.
+
+    MUST-VERIFY (logged each run — see _LEDGER_SHIPMENT_EVENT_TYPES TODO): the distinct
+    event-type strings found, that required TSV headers exist, MCF reconciliation, and the
+    quantity sign convention.
+    """
+    marketplace_ids = [m.strip() for m in SP_MARKETPLACE_ID.split(",") if m.strip()]
+
+    log.info(f"{'='*60}")
+    log.info(f"FBA INVENTORY LEDGER: {start} → {end}  (brand: {brand}, marketplaces: {marketplace_ids})")
+    log.info(f"{'='*60}")
+
+    api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
+    resp = api.create_report(
+        reportType="GET_LEDGER_DETAIL_VIEW_DATA",
+        dataStartTime=start.strftime("%Y-%m-%dT00:00:00Z"),
+        dataEndTime=end.strftime("%Y-%m-%dT23:59:59Z"),
+        marketplaceIds=marketplace_ids,
+    )
+    report_id = resp.payload["reportId"]
+    log.info(f"  Ledger report ID: {report_id} — polling…")
+    doc_id  = _sp_wait(api, report_id, timeout=1800)
+    content = _sp_download(api, doc_id)
+
+    rows, event_counts = _parse_ledger_tsv(content, brand)
+
+    # MUST-VERIFY logging: distinct event types found — lock the filter from this.
+    log.info(f"  Ledger distinct event types seen: {event_counts}")
+    log.info(f"  Customer-shipment rows after filter "
+             f"(matched {sorted(_LEDGER_SHIPMENT_EVENT_TYPES)}): {len(rows)}")
+
+    # Idempotent overwrite of the trailing reconciliation window, then upsert the rest.
+    overwrite_from = max(start, end - timedelta(days=_LEDGER_OVERWRITE_DAYS - 1))
+    supabase_delete_range("fba_daily_shipped", brand, overwrite_from, end)
+    log.info(f"  Cleared trailing window {overwrite_from} → {end} for idempotent re-insert")
+
+    supabase_upsert("fba_daily_shipped", rows)
+
+    units_total = sum(r["units"] for r in rows)
+    n_mskus = len({r["msku"] for r in rows})
+    n_days  = len({r["ship_date"] for r in rows})
+    log.info(f"✓ Ledger: {len(rows)} row(s), {n_mskus} MSKU(s), {units_total} units across {n_days} day(s)")
+    print(f"\n  ✓ Inventory ledger {start} → {end}: {len(rows)} rows, "
+          f"{n_mskus} MSKUs, {units_total} units shipped\n")
+
+
 # ── Orchestration ──────────────────────────────────────────────────────────────
 
 def pull_day(target: date, brand: str) -> None:
@@ -1284,6 +1494,8 @@ def main() -> None:
                         help="Pull Orders API only (hourly_sales heatmap). Skip SP-API + Ads API.")
     parser.add_argument("--campaigns-only", action="store_true",
                         help="Pull per-campaign Ads performance only (campaign_daily). Skip everything else.")
+    parser.add_argument("--ledger-only", action="store_true",
+                        help="Pull FBA Inventory Ledger only (fba_daily_shipped). Skip everything else.")
     args = parser.parse_args()
 
     # ── Orders-only mode ────────────────────────────────────────────────────────
@@ -1324,6 +1536,26 @@ def main() -> None:
             ads_pull_campaigns_range(yesterday, yesterday, args.brand)
         return
 
+    # ── Ledger-only mode ────────────────────────────────────────────────────────
+    if args.ledger_only:
+        if args.start and args.end:
+            log.info("Ledger-only backfill mode")
+            fetch_inventory_ledger(
+                date.fromisoformat(args.start),
+                date.fromisoformat(args.end),
+                args.brand,
+            )
+        elif args.date:
+            d = date.fromisoformat(args.date)
+            log.info(f"Ledger-only single-day mode: {d}")
+            fetch_inventory_ledger(d, d, args.brand)
+        else:
+            led_end   = date.today() - timedelta(days=1)
+            led_start = date.today() - timedelta(days=_LEDGER_LOOKBACK_DAYS)
+            log.info(f"Ledger-only mode: last {_LEDGER_LOOKBACK_DAYS} days ({led_start} → {led_end})")
+            fetch_inventory_ledger(led_start, led_end, args.brand)
+        return
+
     # ── Full pull modes ─────────────────────────────────────────────────────────
     if args.start and args.end:
         backfill_range(
@@ -1340,6 +1572,16 @@ def main() -> None:
         auto_backfill_ppc_gaps(args.brand, lookback_days=30)     # days with revenue but no PPC
         auto_refresh_asin_sessions(args.brand, lookback_days=30) # days with sessions=0 (delayed traffic)
         pull_day(date.today() - timedelta(days=1), args.brand)
+
+        # FBA Inventory Ledger: rolling depletion feed (MCF-inclusive) for forecasting.
+        # Additive — a ledger failure must never break the core daily pull above.
+        try:
+            led_end   = date.today() - timedelta(days=1)
+            led_start = date.today() - timedelta(days=_LEDGER_LOOKBACK_DAYS)
+            fetch_inventory_ledger(led_start, led_end, args.brand)
+        except Exception as exc:
+            log.error(f"Inventory ledger pull failed (non-fatal): {exc}")
+            log.error(traceback.format_exc())
 
 
 if __name__ == "__main__":
