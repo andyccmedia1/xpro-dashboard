@@ -1298,12 +1298,27 @@ def fetch_inventory_ledger(start: date, end: date, brand: str) -> None:
     log.info(f"{'='*60}")
 
     api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
-    resp = api.create_report(
-        reportType="GET_LEDGER_DETAIL_VIEW_DATA",
-        dataStartTime=start.strftime("%Y-%m-%dT00:00:00Z"),
-        dataEndTime=end.strftime("%Y-%m-%dT23:59:59Z"),
-        marketplaceIds=marketplace_ids,
-    )
+    try:
+        resp = api.create_report(
+            reportType="GET_LEDGER_DETAIL_VIEW_DATA",
+            dataStartTime=start.strftime("%Y-%m-%dT00:00:00Z"),
+            dataEndTime=end.strftime("%Y-%m-%dT23:59:59Z"),
+            marketplaceIds=marketplace_ids,
+        )
+    except Exception as exc:
+        # A 403 here means the refresh token doesn't carry the "Amazon Fulfillment"
+        # role (or Amazon hasn't attached it server-side). Surface the Amazon request
+        # id so it can be handed to SP-API developer support.
+        hdrs = getattr(exc, "headers", None) or {}
+        req_id = hdrs.get("x-amzn-RequestId") or hdrs.get("x-amzn-requestid") or "unknown"
+        log.error(
+            f"create_report failed for GET_LEDGER_DETAIL_VIEW_DATA: {type(exc).__name__}: {exc}"
+        )
+        log.error(
+            f"  → If this is a 403/Unauthorized: the token lacks the 'Amazon Fulfillment' role. "
+            f"Amazon request id (for a support case): {req_id}"
+        )
+        raise
     report_id = resp.payload["reportId"]
     log.info(f"  Ledger report ID: {report_id} — polling…")
     doc_id  = _sp_wait(api, report_id, timeout=1800)
