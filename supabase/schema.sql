@@ -207,3 +207,74 @@ from fba_daily_shipped
 group by msku, brand;
 
 grant select on sku_velocity to authenticated, service_role;
+
+
+-- ── 7. shopify_daily_shipped ─────────────────────────────────
+-- One row per ship_date per MSKU per brand — units on Shopify ONLINE-STORE orders,
+-- which are all fulfilled via Amazon MCF and therefore deplete the same FBA pool as
+-- Amazon-marketplace orders. This is the MCF half of FBA depletion, captured directly
+-- from Shopify while the FBA Inventory Ledger (GET_LEDGER_DETAIL_VIEW_DATA) is blocked
+-- on the Amazon Fulfillment role.
+--
+-- Notes:
+--   • Shopify SKU == Amazon MSKU for this catalog, so it joins straight to Amazon data.
+--   • TikTok orders flow into the same Shopify store but ship from a 3PL — the pull
+--     EXCLUDES them (by the "Shipped by TikTok" tag), so they don't count as FBA draw.
+
+create table if not exists shopify_daily_shipped (
+  ship_date  date         not null,
+  msku       text         not null,
+  brand      varchar(50)  not null default 'xpro',
+  units      integer      not null default 0,
+  updated_at timestamptz  not null default now(),
+
+  primary key (ship_date, msku, brand)
+);
+
+create or replace trigger shopify_daily_shipped_updated_at
+  before update on shopify_daily_shipped
+  for each row execute function set_updated_at();
+
+alter table shopify_daily_shipped enable row level security;
+
+create policy "authenticated users can read shopify_daily_shipped"
+  on shopify_daily_shipped for select to authenticated using (true);
+
+create policy "authenticated users can insert shopify_daily_shipped"
+  on shopify_daily_shipped for insert to authenticated with check (true);
+
+create policy "authenticated users can update shopify_daily_shipped"
+  on shopify_daily_shipped for update to authenticated using (true);
+
+grant select, insert, update, delete on shopify_daily_shipped to service_role;
+
+create index if not exists idx_shopify_daily_shipped_brand_date
+  on shopify_daily_shipped (brand, ship_date desc);
+
+create index if not exists idx_shopify_daily_shipped_msku
+  on shopify_daily_shipped (msku);
+
+
+-- ── 8. shopify_sku_velocity (view) ───────────────────────────
+-- Same shape as sku_velocity (incl. a null asin column) so the dashboard can read
+-- either source interchangeably. Rolling 7/14/30/60/90-day units + per-day velocity.
+
+create or replace view shopify_sku_velocity as
+select
+  msku,
+  brand,
+  null::varchar(20) as asin,
+  coalesce(sum(units) filter (where ship_date > current_date - 7),  0) as units_7,
+  coalesce(sum(units) filter (where ship_date > current_date - 14), 0) as units_14,
+  coalesce(sum(units) filter (where ship_date > current_date - 30), 0) as units_30,
+  coalesce(sum(units) filter (where ship_date > current_date - 60), 0) as units_60,
+  coalesce(sum(units) filter (where ship_date > current_date - 90), 0) as units_90,
+  round(coalesce(sum(units) filter (where ship_date > current_date - 7),  0) / 7.0,  2) as vel_7,
+  round(coalesce(sum(units) filter (where ship_date > current_date - 14), 0) / 14.0, 2) as vel_14,
+  round(coalesce(sum(units) filter (where ship_date > current_date - 30), 0) / 30.0, 2) as vel_30,
+  round(coalesce(sum(units) filter (where ship_date > current_date - 60), 0) / 60.0, 2) as vel_60,
+  round(coalesce(sum(units) filter (where ship_date > current_date - 90), 0) / 90.0, 2) as vel_90
+from shopify_daily_shipped
+group by msku, brand;
+
+grant select on shopify_sku_velocity to authenticated, service_role;

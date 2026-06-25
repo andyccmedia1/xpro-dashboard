@@ -117,6 +117,19 @@ _LEDGER_SHIPMENT_NORM  = {e.lower().replace(" ", "") for e in _LEDGER_SHIPMENT_E
 _LEDGER_LOOKBACK_DAYS  = 95   # > 90 so the 90-day velocity window is always full
 _LEDGER_OVERWRITE_DAYS = 5    # re-pull/overwrite trailing N days each run (ledger reconciles)
 
+# ── Shopify (online-store MCF depletion) ───────────────────────────────────────
+# All Shopify online-store orders are fulfilled via Amazon MCF, so they deplete the
+# same FBA pool as Amazon orders — the MCF half the Sales & Traffic report can't see.
+# TikTok orders flow into the same store but ship from a 3PL, so they're EXCLUDED by
+# the "Shipped by TikTok" tag. Shopify SKU == Amazon MSKU for this catalog.
+# Optional creds: if unset, the Shopify pull simply skips (won't break other pulls).
+SHOPIFY_STORE_DOMAIN   = os.getenv("SHOPIFY_STORE_DOMAIN")   # e.g. xproaccessories.myshopify.com
+SHOPIFY_ADMIN_TOKEN    = os.getenv("SHOPIFY_ADMIN_TOKEN")    # shpat_… (read_orders scope)
+_SHOPIFY_API_VERSION   = "2024-10"
+_SHOPIFY_EXCLUDE_TAG   = os.getenv("SHOPIFY_EXCLUDE_TAG", "Shipped by TikTok")
+_SHOPIFY_LOOKBACK_DAYS = 30   # scheduled-run window (backfill covers the full 90d history)
+_SHOPIFY_OVERWRITE_DAYS = 3   # re-pull/overwrite trailing N days each run for idempotency
+
 _AD_TYPES = [
     {"adProduct": "SPONSORED_PRODUCTS", "reportTypeId": "spCampaigns", "label": "SP"},
     {"adProduct": "SPONSORED_BRANDS",   "reportTypeId": "sbCampaigns", "label": "SB"},
@@ -1346,6 +1359,149 @@ def fetch_inventory_ledger(start: date, end: date, brand: str) -> None:
           f"{n_mskus} MSKUs, {units_total} units shipped\n")
 
 
+# ── Shopify (online-store MCF depletion) ───────────────────────────────────────
+
+_SHOPIFY_ORDERS_QUERY = """
+query($cursor: String, $q: String!) {
+  orders(first: 100, after: $cursor, query: $q, sortKey: CREATED_AT) {
+    edges {
+      node {
+        createdAt
+        cancelledAt
+        tags
+        lineItems(first: 100) {
+          edges { node { sku quantity } }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
+def _shopify_graphql(url: str, headers: dict, variables: dict, max_retries: int = 5) -> dict:
+    """POST a GraphQL query, retrying on Shopify rate limiting (HTTP 429 or THROTTLED)."""
+    backoff = [2, 5, 10, 20, 30]
+    for attempt in range(max_retries + 1):
+        resp = requests.post(
+            url, headers=headers,
+            json={"query": _SHOPIFY_ORDERS_QUERY, "variables": variables},
+            timeout=60,
+        )
+        if resp.status_code == 429:
+            wait = backoff[min(attempt, len(backoff) - 1)]
+            log.warning(f"  Shopify 429 — waiting {wait}s")
+            time.sleep(wait)
+            continue
+        if not resp.ok:
+            log.error(f"Shopify {resp.status_code}: {resp.text[:300]}")
+            resp.raise_for_status()
+        data = resp.json()
+        errs = data.get("errors")
+        if errs:
+            throttled = any((e.get("extensions") or {}).get("code") == "THROTTLED" for e in errs)
+            if throttled and attempt < max_retries:
+                wait = backoff[min(attempt, len(backoff) - 1)]
+                log.warning(f"  Shopify THROTTLED — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Shopify GraphQL errors: {errs}")
+        return data["data"]
+    raise RuntimeError("Shopify GraphQL: exhausted retries")
+
+
+def fetch_shopify_orders(start: date, end: date, brand: str) -> None:
+    """
+    Pull Shopify ONLINE-STORE orders for [start, end], sum units per (ship_date, msku),
+    and upsert into shopify_daily_shipped — the MCF half of FBA depletion.
+
+    All online-store orders are MCF-fulfilled from Amazon FBA, so every unit here draws
+    down the same pool as Amazon orders. TikTok orders (which ship from a 3PL) are
+    excluded by tag. Cancelled orders are skipped. Bucketed by order date in the seller
+    timezone, consistent with the Orders heatmap.
+
+    Idempotent: deletes + re-inserts the trailing _SHOPIFY_OVERWRITE_DAYS days each run.
+    Skips cleanly if SHOPIFY_STORE_DOMAIN / SHOPIFY_ADMIN_TOKEN are not set.
+    """
+    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ADMIN_TOKEN:
+        log.warning("Shopify creds not set (SHOPIFY_STORE_DOMAIN / SHOPIFY_ADMIN_TOKEN) — skipping Shopify pull")
+        return
+
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{_SHOPIFY_API_VERSION}/graphql.json"
+    headers = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json"}
+    end_excl = end + timedelta(days=1)   # created_at:< next day → include the whole end day
+    q = (f"created_at:>={start.isoformat()} created_at:<{end_excl.isoformat()} "
+         f"-tag:'{_SHOPIFY_EXCLUDE_TAG}'")
+
+    log.info(f"{'='*60}")
+    log.info(f"SHOPIFY ONLINE-STORE (MCF): {start} → {end}  (brand: {brand}, excl tag: '{_SHOPIFY_EXCLUDE_TAG}')")
+    log.info(f"{'='*60}")
+
+    agg: dict[tuple[str, str], int] = {}
+    excluded_tiktok = 0
+    cursor: str | None = None
+    page = 0
+
+    while True:
+        page += 1
+        conn = _shopify_graphql(url, headers, {"cursor": cursor, "q": q})["orders"]
+
+        for edge in conn["edges"]:
+            node = edge["node"]
+            if node.get("cancelledAt"):
+                continue
+            # Belt-and-suspenders: skip anything tagged TikTok even if the query filter shifts
+            if any("tiktok" in (t or "").lower() for t in (node.get("tags") or [])):
+                excluded_tiktok += 1
+                continue
+
+            try:
+                utc_dt   = _dt.fromisoformat(node["createdAt"].replace("Z", "+00:00"))
+                local_dt = utc_dt.astimezone(_SELLER_TZ)
+                date_str = local_dt.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+
+            d = date.fromisoformat(date_str)
+            if d < start or d > end:
+                continue
+
+            for li in node["lineItems"]["edges"]:
+                sku = (li["node"].get("sku") or "").strip()
+                qty = li["node"].get("quantity") or 0
+                if not sku or qty <= 0:
+                    continue
+                key = (date_str, sku)
+                agg[key] = agg.get(key, 0) + qty
+
+        if conn["pageInfo"]["hasNextPage"]:
+            cursor = conn["pageInfo"]["endCursor"]
+            time.sleep(0.6)   # gentle on the GraphQL rate bucket
+            log.info(f"  Shopify page {page}: {len(agg)} (date,sku) buckets so far…")
+        else:
+            break
+
+    rows = [
+        {"ship_date": d, "msku": s, "brand": brand, "units": u}
+        for (d, s), u in agg.items()
+    ]
+
+    overwrite_from = max(start, end - timedelta(days=_SHOPIFY_OVERWRITE_DAYS - 1))
+    supabase_delete_range("shopify_daily_shipped", brand, overwrite_from, end)
+    log.info(f"  Cleared trailing window {overwrite_from} → {end} for idempotent re-insert")
+
+    supabase_upsert("shopify_daily_shipped", rows)
+
+    units_total = sum(r["units"] for r in rows)
+    n_mskus = len({r["msku"] for r in rows})
+    n_days  = len({r["ship_date"] for r in rows})
+    log.info(f"✓ Shopify: {len(rows)} row(s), {n_mskus} MSKU(s), {units_total} units across {n_days} day(s) "
+             f"({excluded_tiktok} TikTok order(s) excluded)")
+    print(f"\n  ✓ Shopify online-store {start} → {end}: {len(rows)} rows, "
+          f"{n_mskus} MSKUs, {units_total} units (MCF)\n")
+
+
 # ── Orchestration ──────────────────────────────────────────────────────────────
 
 def pull_day(target: date, brand: str) -> None:
@@ -1511,6 +1667,8 @@ def main() -> None:
                         help="Pull per-campaign Ads performance only (campaign_daily). Skip everything else.")
     parser.add_argument("--ledger-only", action="store_true",
                         help="Pull FBA Inventory Ledger only (fba_daily_shipped). Skip everything else.")
+    parser.add_argument("--shopify-only", action="store_true",
+                        help="Pull Shopify online-store MCF units only (shopify_daily_shipped). Skip everything else.")
     args = parser.parse_args()
 
     # ── Orders-only mode ────────────────────────────────────────────────────────
@@ -1571,6 +1729,26 @@ def main() -> None:
             fetch_inventory_ledger(led_start, led_end, args.brand)
         return
 
+    # ── Shopify-only mode ───────────────────────────────────────────────────────
+    if args.shopify_only:
+        if args.start and args.end:
+            log.info("Shopify-only backfill mode")
+            fetch_shopify_orders(
+                date.fromisoformat(args.start),
+                date.fromisoformat(args.end),
+                args.brand,
+            )
+        elif args.date:
+            d = date.fromisoformat(args.date)
+            log.info(f"Shopify-only single-day mode: {d}")
+            fetch_shopify_orders(d, d, args.brand)
+        else:
+            shop_end   = date.today() - timedelta(days=1)
+            shop_start = date.today() - timedelta(days=_SHOPIFY_LOOKBACK_DAYS)
+            log.info(f"Shopify-only mode: last {_SHOPIFY_LOOKBACK_DAYS} days ({shop_start} → {shop_end})")
+            fetch_shopify_orders(shop_start, shop_end, args.brand)
+        return
+
     # ── Full pull modes ─────────────────────────────────────────────────────────
     if args.start and args.end:
         backfill_range(
@@ -1596,6 +1774,16 @@ def main() -> None:
             fetch_inventory_ledger(led_start, led_end, args.brand)
         except Exception as exc:
             log.error(f"Inventory ledger pull failed (non-fatal): {exc}")
+            log.error(traceback.format_exc())
+
+        # Shopify online-store MCF depletion (the MCF half, sourced directly from Shopify
+        # while the FBA ledger is blocked). Also additive and non-fatal.
+        try:
+            shop_end   = date.today() - timedelta(days=1)
+            shop_start = date.today() - timedelta(days=_SHOPIFY_LOOKBACK_DAYS)
+            fetch_shopify_orders(shop_start, shop_end, args.brand)
+        except Exception as exc:
+            log.error(f"Shopify pull failed (non-fatal): {exc}")
             log.error(traceback.format_exc())
 
 

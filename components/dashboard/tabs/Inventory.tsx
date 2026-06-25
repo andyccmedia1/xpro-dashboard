@@ -35,12 +35,13 @@ export default function Inventory() {
   const [loading, setLoading] = useState(true)
   const [win,     setWin]     = useState<Window>(30)
   const [q,       setQ]       = useState('')
+  const [source,  setSource]  = useState<'ledger' | 'shopify'>('ledger')
 
   const load = useCallback(() => {
     setLoading(true)
     fetch('/api/inventory')
       .then(r => r.json())
-      .then(d => { setSkus(d.skus ?? []); setLoading(false) })
+      .then(d => { setSkus(d.skus ?? []); setSource(d.source ?? 'ledger'); setLoading(false) })
       .catch(() => setLoading(false))
   }, [])
 
@@ -70,8 +71,9 @@ export default function Inventory() {
         <div>
           <h2 className="text-xl font-bold text-white">Inventory Velocity</h2>
           <p className="text-gray-400 text-sm mt-0.5">
-            Units shipped from the FBA pool — includes Amazon orders <span className="text-gray-300">and</span> Shopify/TikTok via MCF.
-            The true depletion signal for replenishment.
+            {source === 'ledger'
+              ? <>Units shipped from the FBA pool — Amazon orders <span className="text-gray-300">and</span> MCF combined. The true depletion signal for replenishment.</>
+              : <>Showing <span className="text-emerald-400">Shopify online-store (MCF)</span> units only — the FBA ledger is pending an Amazon permission, so Amazon-marketplace units aren’t merged in yet.</>}
           </p>
         </div>
 
