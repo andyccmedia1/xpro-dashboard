@@ -37,6 +37,11 @@ on:
         required: false
         type: boolean
         default: false
+      shopify_only:
+        description: 'Shopify online-store MCF units only — populate shopify_daily_shipped (the MCF half of FBA depletion). Skips everything else.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   pull:
@@ -69,6 +74,9 @@ jobs:
           if [ "${{ github.event.inputs.ledger_only }}" = "true" ]; then
             CMD="$CMD --ledger-only"
           fi
+          if [ "${{ github.event.inputs.shopify_only }}" = "true" ]; then
+            CMD="$CMD --shopify-only"
+          fi
 
           if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
             $CMD --start "${{ github.event.inputs.start_date }}" --end "${{ github.event.inputs.end_date }}"
@@ -91,5 +99,8 @@ jobs:
           # ── Supabase ───────────────────────────────────────────────────────
           SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # ── Shopify (online-store MCF depletion) ────────────────────────────
+          SHOPIFY_STORE_DOMAIN:      ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_ADMIN_TOKEN:       ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
           # ── Brand ──────────────────────────────────────────────────────────
           ACTIVE_BRAND:              xpro
