@@ -42,6 +42,11 @@ on:
         required: false
         type: boolean
         default: false
+      mcf_probe:
+        description: 'Read-only test: can we access the Fulfillment Outbound API (MCF orders)? Diagnoses the Amazon Fulfillment role. Writes nothing.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   pull:
@@ -76,6 +81,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.shopify_only }}" = "true" ]; then
             CMD="$CMD --shopify-only"
+          fi
+          if [ "${{ github.event.inputs.mcf_probe }}" = "true" ]; then
+            CMD="$CMD --mcf-probe"
           fi
 
           if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then

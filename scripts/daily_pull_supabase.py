@@ -49,7 +49,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from sp_api.api import Reports, Orders as SpOrders
+from sp_api.api import Reports, Orders as SpOrders, FulfillmentOutbound
 from sp_api.base import Marketplaces
 
 load_dotenv()
@@ -1359,6 +1359,63 @@ def fetch_inventory_ledger(start: date, end: date, brand: str) -> None:
           f"{n_mskus} MSKUs, {units_total} units shipped\n")
 
 
+# ── MCF probe (Fulfillment Outbound API) ───────────────────────────────────────
+
+def fetch_mcf_probe(brand: str) -> None:
+    """
+    READ-ONLY diagnostic. Tests whether the Fulfillment Outbound API (MCF orders) is
+    accessible with the current token. It's a DIFFERENT API surface than the Reports
+    ledger but shares the SAME Amazon Fulfillment role — so:
+      • If it WORKS  → the role is attached; the ledger 403 is report-type-specific,
+                       and this API itself is a clean MCF data source we can pull from.
+      • If it 403s   → the role genuinely isn't granting access → support case.
+    Logs a small non-PII sample (order ids, status, dates, and one order's SKUs) or the
+    403 request id. Writes nothing to the database.
+    """
+    api = FulfillmentOutbound(credentials=SP_CREDS, marketplace=Marketplaces.US)
+    query_start = (date.today() - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
+
+    log.info(f"{'='*60}")
+    log.info(f"MCF PROBE (Fulfillment Outbound) — orders since {query_start[:10]}")
+    log.info(f"{'='*60}")
+
+    try:
+        resp = api.get_fulfillment_orders(queryStartDate=query_start)
+    except Exception as exc:
+        hdrs   = getattr(exc, "headers", None) or {}
+        req_id = hdrs.get("x-amzn-RequestId") or hdrs.get("x-amzn-requestid") or "unknown"
+        log.error(f"get_fulfillment_orders failed: {type(exc).__name__}: {exc}")
+        log.error(f"  → If this is 403/Unauthorized, the token still lacks the 'Amazon "
+                  f"Fulfillment' role. Amazon request id (for support): {req_id}")
+        raise
+
+    payload = resp.payload or {}
+    orders  = payload.get("fulfillmentOrders") or payload.get("FulfillmentOrders") or []
+    log.info(f"✓ Fulfillment Outbound ACCESSIBLE — {len(orders)} MCF order(s) in the last 30 days")
+
+    for o in orders[:5]:
+        sfid = o.get("sellerFulfillmentOrderId") or o.get("SellerFulfillmentOrderId")
+        disp = o.get("displayableOrderId")       or o.get("DisplayableOrderId")
+        stat = o.get("fulfillmentOrderStatus")   or o.get("FulfillmentOrderStatus")
+        recv = o.get("receivedDate")             or o.get("ReceivedDate")
+        log.info(f"  order: id={sfid} | displayable={disp} | status={stat} | received={recv}")
+
+    # Pull one order's line items to confirm we can get SKU + quantity
+    if orders:
+        sfid = orders[0].get("sellerFulfillmentOrderId") or orders[0].get("SellerFulfillmentOrderId")
+        try:
+            detail = (api.get_fulfillment_order(sellerFulfillmentOrderId=sfid).payload or {})
+            items  = detail.get("fulfillmentOrderItems") or detail.get("FulfillmentOrderItems") or []
+            parts  = [f"{it.get('sellerSku') or it.get('SellerSku')} x{it.get('quantity') or it.get('Quantity')}"
+                      for it in items]
+            log.info(f"  sample SKUs for {sfid}: {parts}")
+        except Exception as exc:
+            log.warning(f"  could not fetch line items for {sfid}: {exc}")
+
+    print(f"\n  ✓ MCF probe OK — Fulfillment Outbound returned {len(orders)} order(s) in 30 days. "
+          f"If this worked, the role is fine and we can pull MCF here.\n")
+
+
 # ── Shopify (online-store MCF depletion) ───────────────────────────────────────
 
 _SHOPIFY_ORDERS_QUERY = """
@@ -1669,7 +1726,14 @@ def main() -> None:
                         help="Pull FBA Inventory Ledger only (fba_daily_shipped). Skip everything else.")
     parser.add_argument("--shopify-only", action="store_true",
                         help="Pull Shopify online-store MCF units only (shopify_daily_shipped). Skip everything else.")
+    parser.add_argument("--mcf-probe", action="store_true",
+                        help="Read-only: test whether the Fulfillment Outbound API (MCF orders) is accessible. No DB writes.")
     args = parser.parse_args()
+
+    # ── MCF probe (read-only diagnostic) ────────────────────────────────────────
+    if args.mcf_probe:
+        fetch_mcf_probe(args.brand)
+        return
 
     # ── Orders-only mode ────────────────────────────────────────────────────────
     if args.orders_only:
