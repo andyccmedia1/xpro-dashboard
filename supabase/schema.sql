@@ -229,10 +229,13 @@ grant select, insert, update, delete on amazon_sku_windows to service_role;
 --   + MCF/Shopify units (fba_daily_shipped, daily rows windowed here).
 -- Full outer join so a SKU selling on either channel still appears.
 
-create or replace view sku_velocity as
+-- drop first: create-or-replace can't change a view column's data type
+drop view if exists sku_velocity;
+
+create view sku_velocity as
 with mcf as (
   select
-    msku, brand, max(asin) as asin,
+    msku, brand, max(asin)::varchar(20) as asin,
     coalesce(sum(units) filter (where ship_date >= current_date - 7  and ship_date < current_date), 0) as u7,
     coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) as u14,
     coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) as u30,
