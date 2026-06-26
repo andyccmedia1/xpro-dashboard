@@ -1380,11 +1380,11 @@ def fetch_mcf_probe(brand: str) -> None:
     log.info(f"{'='*60}")
 
     try:
-        resp = api.get_fulfillment_orders(queryStartDate=query_start)
+        resp = api.list_all_fulfillment_orders(queryStartDate=query_start)
     except Exception as exc:
         hdrs   = getattr(exc, "headers", None) or {}
         req_id = hdrs.get("x-amzn-RequestId") or hdrs.get("x-amzn-requestid") or "unknown"
-        log.error(f"get_fulfillment_orders failed: {type(exc).__name__}: {exc}")
+        log.error(f"list_all_fulfillment_orders failed: {type(exc).__name__}: {exc}")
         log.error(f"  → If this is 403/Unauthorized, the token still lacks the 'Amazon "
                   f"Fulfillment' role. Amazon request id (for support): {req_id}")
         raise
