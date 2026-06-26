@@ -1516,10 +1516,13 @@ def fetch_mcf_orders(start: date, end: date, brand: str) -> None:
         items = _mcf_get_order_items(api, sfid)
         for it in items:
             sku = (it.get("sellerSku") or it.get("SellerSku") or "").strip()
-            qty = it.get("quantity") or it.get("Quantity") or 0
+            try:
+                qty = int(it.get("quantity") or it.get("Quantity") or 0)
+            except (ValueError, TypeError):
+                continue
             if not sku or qty <= 0:
                 continue
-            agg[(date_str, sku)] = agg.get((date_str, sku), 0) + int(qty)
+            agg[(date_str, sku)] = agg.get((date_str, sku), 0) + qty
         counted += 1
         time.sleep(0.5)   # ~2 req/sec for the per-order detail calls
 
