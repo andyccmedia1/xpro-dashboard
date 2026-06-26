@@ -1553,6 +1553,23 @@ def fetch_mcf_orders(start: date, end: date, brand: str) -> None:
 
 # ── Amazon marketplace units by SKU (Sales & Traffic windows) ──────────────────
 
+def _sp_create_report_retry(api: Reports, max_retries: int = 6, **kwargs):
+    """create_report with exponential backoff on throttling — the createReport quota
+    is low (~1/min sustained), so submitting several reports needs 429 retries."""
+    backoff = [20, 40, 60, 90, 120, 120]
+    for attempt in range(max_retries + 1):
+        try:
+            return api.create_report(**kwargs)
+        except Exception as exc:
+            throttled = "Throttl" in type(exc).__name__ or "QuotaExceeded" in str(exc)
+            if throttled and attempt < max_retries:
+                wait = backoff[min(attempt, len(backoff) - 1)]
+                log.warning(f"  createReport throttled — waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            raise
+
+
 def _pull_listings_asin_sku_map() -> dict[str, str]:
     """
     Pull GET_MERCHANT_LISTINGS_ALL_DATA → {asin: seller_sku}. Catalog is 1:1 ASIN↔SKU,
@@ -1562,7 +1579,8 @@ def _pull_listings_asin_sku_map() -> dict[str, str]:
     api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
     marketplace_ids = [m.strip() for m in SP_MARKETPLACE_ID.split(",") if m.strip()]
     try:
-        resp = api.create_report(
+        resp = _sp_create_report_retry(
+            api,
             reportType="GET_MERCHANT_LISTINGS_ALL_DATA",
             marketplaceIds=marketplace_ids,
         )
@@ -1624,9 +1642,10 @@ def fetch_amazon_sales_windows(brand: str) -> None:
     pending: list[tuple[str, int]] = []
     for i, N in enumerate(windows):
         if i > 0:
-            time.sleep(5)
+            time.sleep(15)   # ease the createReport quota between submissions
         start = yesterday - timedelta(days=N - 1)
-        resp = api.create_report(
+        resp = _sp_create_report_retry(
+            api,
             reportType="GET_SALES_AND_TRAFFIC_REPORT",
             dataStartTime=start.strftime("%Y-%m-%dT00:00:00Z"),
             dataEndTime=yesterday.strftime("%Y-%m-%dT23:59:59Z"),
