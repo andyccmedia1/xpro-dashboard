@@ -278,3 +278,44 @@ from shopify_daily_shipped
 group by msku, brand;
 
 grant select on shopify_sku_velocity to authenticated, service_role;
+
+
+-- ── 9. sku_params ────────────────────────────────────────────
+-- Per-SKU inventory inputs for the Forecast tab (lead time, on-hand, MOQ, etc.).
+-- The 7/14/30/60/90 velocity is auto-loaded from sku_velocity; these are the
+-- planning parameters the user sets. One row per MSKU per brand.
+
+create table if not exists sku_params (
+  msku              text         not null,
+  brand             varchar(50)  not null default 'xpro',
+  on_hand           integer      not null default 0,    -- current FBA on-hand units
+  inbound_qty       integer      not null default 0,    -- a scheduled inbound shipment
+  inbound_days      integer      not null default 0,    -- days until that inbound arrives
+  lead_time_days    integer      not null default 80,   -- reorder lead time
+  safety_stock_days integer      not null default 15,   -- days of safety stock
+  moq               integer      not null default 0,    -- minimum order quantity
+  casepack          integer      not null default 1,    -- order rounding multiple
+  cycle_cover_days  integer      not null default 35,   -- order-up-to cycle coverage
+  updated_at        timestamptz  not null default now(),
+
+  primary key (msku, brand)
+);
+
+create or replace trigger sku_params_updated_at
+  before update on sku_params
+  for each row execute function set_updated_at();
+
+alter table sku_params enable row level security;
+
+create policy "authenticated users can read sku_params"
+  on sku_params for select to authenticated using (true);
+
+create policy "authenticated users can insert sku_params"
+  on sku_params for insert to authenticated with check (true);
+
+create policy "authenticated users can update sku_params"
+  on sku_params for update to authenticated using (true);
+
+grant select, insert, update, delete on sku_params to service_role;
+
+grant select on shopify_sku_velocity to authenticated, service_role;

@@ -10,6 +10,7 @@ import DataManager     from '@/components/dashboard/tabs/DataManager'
 import Heatmap         from '@/components/dashboard/tabs/Heatmap'
 import BudgetAllocator from '@/components/dashboard/tabs/BudgetAllocator'
 import Inventory       from '@/components/dashboard/tabs/Inventory'
+import Forecast        from '@/components/dashboard/tabs/Forecast'
 
 const TABS = [
   { id: 'overview',  label: 'Overview' },
@@ -19,6 +20,7 @@ const TABS = [
   { id: 'heatmap',   label: 'Sales Heatmap' },
   { id: 'budget',    label: 'Budget Allocator' },
   { id: 'inventory', label: 'Inventory' },
+  { id: 'forecast',  label: 'Forecast' },
   { id: 'data',      label: 'Data Manager' },
 ]
 
@@ -122,6 +124,7 @@ export default function DashboardShell({ userEmail }: { userEmail: string }) {
         {activeTab === 'heatmap'  && <Heatmap />}
         {activeTab === 'budget'   && <BudgetAllocator />}
         {activeTab === 'inventory'&& <Inventory />}
+        {activeTab === 'forecast' && <Forecast />}
         {activeTab === 'data'     && <DataManager />}
       </main>
     </div>

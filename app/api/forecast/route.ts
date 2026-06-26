@@ -1,0 +1,86 @@
+import { createAdminClient } from '@/lib/supabase/server'
+import { NextResponse }       from 'next/server'
+
+// Default planning params when a SKU has no sku_params row yet.
+const DEFAULTS = {
+  on_hand: 0, inbound_qty: 0, inbound_days: 0,
+  lead_time_days: 80, safety_stock_days: 15,
+  moq: 0, casepack: 1, cycle_cover_days: 35,
+}
+
+const num = (v: unknown) => {
+  const n = typeof v === 'string' ? parseFloat(v) : (v as number)
+  return Number.isFinite(n) ? n : 0
+}
+
+// GET /api/forecast?brand=xpro
+// Returns each SKU's velocity (from sku_velocity, falling back to shopify_sku_velocity)
+// merged with its planning params (sku_params, with defaults).
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url)
+  const brand = searchParams.get('brand') ?? 'xpro'
+  const supabase = createAdminClient()
+
+  const velCols = 'msku, asin, units_7, units_14, units_30, units_60, units_90, vel_7, vel_14, vel_30, vel_60, vel_90'
+  let source: 'ledger' | 'shopify' = 'ledger'
+  let { data: vel, error } = await supabase.from('sku_velocity').select(velCols).eq('brand', brand)
+  if (!error && (!vel || vel.length === 0)) {
+    source = 'shopify'
+    ;({ data: vel, error } = await supabase.from('shopify_sku_velocity').select(velCols).eq('brand', brand))
+  }
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+
+  const { data: params } = await supabase
+    .from('sku_params')
+    .select('msku, on_hand, inbound_qty, inbound_days, lead_time_days, safety_stock_days, moq, casepack, cycle_cover_days')
+    .eq('brand', brand)
+
+  const paramMap = new Map<string, Record<string, unknown>>()
+  for (const p of (params ?? []) as Record<string, unknown>[]) paramMap.set(p.msku as string, p)
+
+  const skus = ((vel ?? []) as Record<string, unknown>[]).map((r) => {
+    const p = paramMap.get(r.msku as string) ?? {}
+    return {
+      msku:  r.msku as string,
+      asin:  (r.asin as string | null) ?? null,
+      v7: num(r.vel_7), v14: num(r.vel_14), v30: num(r.vel_30), v60: num(r.vel_60), v90: num(r.vel_90),
+      units_7: num(r.units_7), units_14: num(r.units_14), units_30: num(r.units_30), units_60: num(r.units_60), units_90: num(r.units_90),
+      on_hand:           num(p.on_hand ?? DEFAULTS.on_hand),
+      inbound_qty:       num(p.inbound_qty ?? DEFAULTS.inbound_qty),
+      inbound_days:      num(p.inbound_days ?? DEFAULTS.inbound_days),
+      lead_time_days:    num(p.lead_time_days ?? DEFAULTS.lead_time_days),
+      safety_stock_days: num(p.safety_stock_days ?? DEFAULTS.safety_stock_days),
+      moq:               num(p.moq ?? DEFAULTS.moq),
+      casepack:          num(p.casepack ?? DEFAULTS.casepack),
+      cycle_cover_days:  num(p.cycle_cover_days ?? DEFAULTS.cycle_cover_days),
+      has_params:        paramMap.has(r.msku as string),
+    }
+  }).sort((a, b) => b.v30 - a.v30)
+
+  return NextResponse.json({ skus, source })
+}
+
+// POST /api/forecast  — upsert one SKU's planning params.
+// body: { brand?, msku, on_hand, inbound_qty, inbound_days, lead_time_days, safety_stock_days, moq, casepack, cycle_cover_days }
+export async function POST(request: Request) {
+  const body = await request.json().catch(() => null)
+  if (!body?.msku) return NextResponse.json({ error: 'msku is required' }, { status: 400 })
+
+  const row = {
+    brand:             body.brand ?? 'xpro',
+    msku:              String(body.msku),
+    on_hand:           Math.round(num(body.on_hand)),
+    inbound_qty:       Math.round(num(body.inbound_qty)),
+    inbound_days:      Math.round(num(body.inbound_days)),
+    lead_time_days:    Math.round(num(body.lead_time_days ?? DEFAULTS.lead_time_days)),
+    safety_stock_days: Math.round(num(body.safety_stock_days ?? DEFAULTS.safety_stock_days)),
+    moq:               Math.round(num(body.moq)),
+    casepack:          Math.max(1, Math.round(num(body.casepack ?? 1))),
+    cycle_cover_days:  Math.round(num(body.cycle_cover_days ?? DEFAULTS.cycle_cover_days)),
+  }
+
+  const supabase = createAdminClient()
+  const { error } = await supabase.from('sku_params').upsert(row, { onConflict: 'msku,brand' })
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  return NextResponse.json({ ok: true })
+}
