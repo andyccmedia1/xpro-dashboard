@@ -38,7 +38,7 @@ on:
         type: boolean
         default: false
       amazon_skus_only:
-        description: 'Amazon orders by SKU only — populate amazon_daily_shipped from the All Orders report (Amazon-marketplace units). Skips everything else.'
+        description: 'Amazon units by SKU only — populate amazon_sku_windows from the Sales & Traffic 7/14/30/60/90 reports (Amazon-marketplace units ordered). Skips everything else.'
         required: false
         type: boolean
         default: false

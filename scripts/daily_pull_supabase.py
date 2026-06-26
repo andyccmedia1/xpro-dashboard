@@ -138,12 +138,10 @@ _SHOPIFY_OVERWRITE_DAYS = 3   # re-pull/overwrite trailing N days each run for i
 _MCF_LOOKBACK_DAYS  = 14   # scheduled-run window (backfill covers the full 90d history)
 _MCF_OVERWRITE_DAYS = 5    # re-pull/overwrite trailing N days each run for idempotency
 
-# ── Amazon marketplace orders by SKU (the other half of FBA depletion) ─────────
-# The All Orders report gives every order line with sku + quantity + fulfillment
-# channel, by order date. We keep Amazon-fulfilled (AFN), non-cancelled lines →
-# amazon_daily_shipped. Combined with MCF in the sku_velocity view = total demand.
-_AMZ_ORDERS_LOOKBACK_DAYS  = 14
-_AMZ_ORDERS_OVERWRITE_DAYS = 5
+# ── Amazon marketplace units by SKU (the other half of FBA depletion) ──────────
+# Sourced from the authoritative Detail Page Sales & Traffic report (units ordered by
+# child ASIN), mapped ASIN→SKU via the listings report, stored as 7/14/30/60/90-day
+# window totals in amazon_sku_windows. Combined with MCF in sku_velocity = total demand.
 
 _AD_TYPES = [
     {"adProduct": "SPONSORED_PRODUCTS", "reportTypeId": "spCampaigns", "label": "SP"},
@@ -1553,126 +1551,158 @@ def fetch_mcf_orders(start: date, end: date, brand: str) -> None:
           f"{units_total} units (Shopify via MCF)\n")
 
 
-# ── Amazon marketplace orders by SKU (All Orders report) ───────────────────────
+# ── Amazon marketplace units by SKU (Sales & Traffic windows) ──────────────────
 
-def _parse_all_orders(content: str, brand: str) -> list[dict]:
+def _pull_listings_asin_sku_map() -> dict[str, str]:
     """
-    Parse a GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL TSV into
-    amazon_daily_shipped rows. Keeps Amazon-fulfilled (AFN) non-cancelled lines,
-    sums quantity per (purchase-date in seller tz, sku). Maps columns by header name.
+    Pull GET_MERCHANT_LISTINGS_ALL_DATA → {asin: seller_sku}. Catalog is 1:1 ASIN↔SKU,
+    so the inverse map is unambiguous. Used to key the (child-ASIN) Sales & Traffic
+    numbers by MSKU.
     """
-    lines = content.split("\n")
-    if not lines or not lines[0].strip():
-        raise RuntimeError("All Orders report was empty")
-
-    headers = lines[0].rstrip("\r").split("\t")
-    i_date  = _ledger_header_index(headers, ["purchase-date"], required=True)
-    i_sku   = _ledger_header_index(headers, ["sku", "seller-sku", "msku"], required=True)
-    i_qty   = _ledger_header_index(headers, ["quantity", "quantity-purchased", "number-of-items"], required=True)
-    i_fc    = _ledger_header_index(headers, ["fulfillment-channel"], required=False)
-    i_stat  = _ledger_header_index(headers, ["order-status", "item-status"], required=False)
-    i_asin  = _ledger_header_index(headers, ["asin"], required=False)
-    need    = max(i_date, i_sku, i_qty)
-
-    agg: dict[tuple[str, str], tuple[int, str | None]] = {}
-    for line in lines[1:]:
-        line = line.rstrip("\r")
-        if not line.strip():
-            continue
-        cells = line.split("\t")
-        if len(cells) <= need:
-            continue
-
-        # Amazon-fulfilled (AFN) only — these deplete the FBA pool like MCF does
-        if i_fc is not None and i_fc < len(cells):
-            if "amazon" not in cells[i_fc].strip().lower():
-                continue
-        # Skip cancelled lines
-        if i_stat is not None and i_stat < len(cells):
-            if "cancel" in cells[i_stat].strip().lower():
-                continue
-
-        raw_date = cells[i_date].strip()
-        try:
-            utc_dt   = _dt.fromisoformat(raw_date.replace("Z", "+00:00"))
-            local_dt = utc_dt.astimezone(_SELLER_TZ)
-            date_str = local_dt.strftime("%Y-%m-%d")
-        except Exception:
-            continue
-
-        sku = cells[i_sku].strip()
-        if not sku:
-            continue
-        try:
-            qty = int(float(cells[i_qty].strip() or 0))
-        except (ValueError, TypeError):
-            continue
-        if qty <= 0:
-            continue
-
-        asin = None
-        if i_asin is not None and i_asin < len(cells):
-            asin = cells[i_asin].strip() or None
-
-        prev = agg.get((date_str, sku))
-        agg[(date_str, sku)] = (((prev[0] if prev else 0) + qty), asin or (prev[1] if prev else None))
-
-    return [
-        {"ship_date": d, "msku": s, "brand": brand, "asin": a, "units": u}
-        for (d, s), (u, a) in agg.items()
-    ]
-
-
-def fetch_amazon_orders_skus(start: date, end: date, brand: str) -> None:
-    """
-    Pull Amazon-marketplace units per SKU for [start, end] from the All Orders report
-    and upsert into amazon_daily_shipped — the Amazon.com half of FBA depletion that the
-    MCF feed doesn't include. Combined with MCF in sku_velocity = total demand.
-
-    Uses the existing SP-API Reports client (Inventory & Order Tracking role).
-    Idempotent: overwrites the trailing _AMZ_ORDERS_OVERWRITE_DAYS days each run.
-    """
-    marketplace_ids = [m.strip() for m in SP_MARKETPLACE_ID.split(",") if m.strip()]
-
-    log.info(f"{'='*60}")
-    log.info(f"AMAZON ORDERS BY SKU (All Orders): {start} → {end}  (brand: {brand})")
-    log.info(f"{'='*60}")
-
     api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
+    marketplace_ids = [m.strip() for m in SP_MARKETPLACE_ID.split(",") if m.strip()]
     try:
         resp = api.create_report(
-            reportType="GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL",
-            dataStartTime=start.strftime("%Y-%m-%dT00:00:00Z"),
-            dataEndTime=end.strftime("%Y-%m-%dT23:59:59Z"),
+            reportType="GET_MERCHANT_LISTINGS_ALL_DATA",
             marketplaceIds=marketplace_ids,
         )
     except Exception as exc:
         hdrs   = getattr(exc, "headers", None) or {}
         req_id = hdrs.get("x-amzn-RequestId") or hdrs.get("x-amzn-requestid") or "unknown"
-        log.error(f"create_report failed for GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL: "
-                  f"{type(exc).__name__}: {exc}")
-        log.error(f"  → If 403/Unauthorized: token lacks order-report access. Amazon request id: {req_id}")
+        log.error(f"create_report failed for GET_MERCHANT_LISTINGS_ALL_DATA: {type(exc).__name__}: {exc}")
+        log.error(f"  → If 403: token lacks listings-report access. Amazon request id: {req_id}")
         raise
 
     report_id = resp.payload["reportId"]
-    log.info(f"  All Orders report ID: {report_id} — polling…")
-    doc_id  = _sp_wait(api, report_id, timeout=1800)
+    doc_id  = _sp_wait(api, report_id, timeout=900)
     content = _sp_download(api, doc_id)
 
-    rows = _parse_all_orders(content, brand)
+    lines = content.split("\n")
+    if not lines or not lines[0].strip():
+        raise RuntimeError("Listings report was empty")
+    headers = lines[0].rstrip("\r").split("\t")
+    i_sku  = _ledger_header_index(headers, ["seller-sku", "sku"], required=True)
+    i_asin = _ledger_header_index(headers, ["asin1", "asin"], required=True)
 
-    overwrite_from = max(start, end - timedelta(days=_AMZ_ORDERS_OVERWRITE_DAYS - 1))
-    supabase_delete_range("amazon_daily_shipped", brand, overwrite_from, end)
-    log.info(f"  Cleared trailing window {overwrite_from} → {end} for idempotent re-insert")
+    mapping: dict[str, str] = {}
+    for line in lines[1:]:
+        cells = line.rstrip("\r").split("\t")
+        if len(cells) <= max(i_sku, i_asin):
+            continue
+        sku  = cells[i_sku].strip()
+        asin = cells[i_asin].strip()
+        if sku and asin:
+            mapping[asin] = sku
+    log.info(f"  Listings map: {len(mapping)} ASIN→SKU pair(s)")
+    return mapping
 
-    supabase_upsert("amazon_daily_shipped", rows)
 
-    units_total = sum(r["units"] for r in rows)
-    n_mskus = len({r["msku"] for r in rows})
-    n_days  = len({r["ship_date"] for r in rows})
-    log.info(f"✓ Amazon orders: {len(rows)} row(s), {n_mskus} MSKU(s), {units_total} units across {n_days} day(s)")
-    print(f"\n  ✓ Amazon orders {start} → {end}: {len(rows)} rows, {n_mskus} MSKUs, "
-          f"{units_total} units (Amazon marketplace)\n")
+def fetch_amazon_sales_windows(brand: str) -> None:
+    """
+    Pull Amazon-marketplace UNITS ORDERED per SKU for the 7/14/30/60/90-day windows
+    ending yesterday, from the authoritative Detail Page Sales & Traffic report
+    (GET_SALES_AND_TRAFFIC_REPORT, child-ASIN granularity), mapped ASIN→SKU via the
+    listings report. Upserts pre-computed window totals into amazon_sku_windows.
+
+    Each window is its own report covering its full range, so 60/90-day windows are
+    complete regardless of daily history. Replaces the brand's rows each run (snapshots).
+    """
+    windows = [7, 14, 30, 60, 90]
+    yesterday = date.today() - timedelta(days=1)
+
+    log.info(f"{'='*60}")
+    log.info(f"AMAZON SALES WINDOWS (Sales & Traffic): {windows} ending {yesterday}  (brand: {brand})")
+    log.info(f"{'='*60}")
+
+    asin_sku = _pull_listings_asin_sku_map()
+    sku_asin = {sku: asin for asin, sku in asin_sku.items()}
+
+    api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
+    marketplace_ids = [m.strip() for m in SP_MARKETPLACE_ID.split(",") if m.strip()]
+
+    # Submit all window reports up front (fan-out), then poll together.
+    pending: list[tuple[str, int]] = []
+    for i, N in enumerate(windows):
+        if i > 0:
+            time.sleep(5)
+        start = yesterday - timedelta(days=N - 1)
+        resp = api.create_report(
+            reportType="GET_SALES_AND_TRAFFIC_REPORT",
+            dataStartTime=start.strftime("%Y-%m-%dT00:00:00Z"),
+            dataEndTime=yesterday.strftime("%Y-%m-%dT23:59:59Z"),
+            reportOptions={"dateGranularity": "DAY", "asinGranularity": "CHILD"},
+            marketplaceIds=marketplace_ids,
+        )
+        pending.append((resp.payload["reportId"], N))
+        log.info(f"  Submitted S&T {N}d ({start} → {yesterday}): {resp.payload['reportId']}")
+
+    completed: list[tuple[str, int]] = []   # (doc_id, N)
+    remaining = list(pending)
+    deadline  = time.time() + 1800
+    while remaining and time.time() < deadline:
+        time.sleep(30)
+        still = []
+        for report_id, N in remaining:
+            try:
+                r = api.get_report(reportId=report_id)
+                status = r.payload["processingStatus"]
+                if status == "DONE":
+                    completed.append((r.payload["reportDocumentId"], N))
+                    log.info(f"  ✓ S&T {N}d done")
+                elif status in ("FATAL", "CANCELLED"):
+                    log.warning(f"  ✗ S&T {N}d: {status}")
+                else:
+                    still.append((report_id, N))
+            except Exception as exc:
+                log.warning(f"  Poll error S&T {N}d: {exc}")
+                still.append((report_id, N))
+        remaining = still
+        if remaining:
+            log.info(f"  Still waiting on {len(remaining)} S&T report(s)…")
+
+    # Parse each window's by-ASIN units ordered → per SKU window totals
+    per_sku: dict[str, dict] = {}
+    for doc_id, N in completed:
+        try:
+            content   = _sp_download(api, doc_id)
+            asin_data = _sp_parse_asin(content)   # {childAsin: {units_ordered, …}}
+            for asin, m in asin_data.items():
+                sku = asin_sku.get(asin)
+                if not sku:
+                    continue
+                units = m.get("units_ordered") or 0
+                row = per_sku.setdefault(sku, {})
+                row[f"units_{N}"] = row.get(f"units_{N}", 0) + int(units)
+            log.info(f"  Parsed S&T {N}d: {len(asin_data)} ASIN(s)")
+        except Exception as exc:
+            log.warning(f"  Failed to parse S&T {N}d: {exc}")
+
+    rows = [
+        {
+            "msku":  sku,
+            "brand": brand,
+            "asin":  sku_asin.get(sku),
+            "units_7":  w.get("units_7", 0),
+            "units_14": w.get("units_14", 0),
+            "units_30": w.get("units_30", 0),
+            "units_60": w.get("units_60", 0),
+            "units_90": w.get("units_90", 0),
+        }
+        for sku, w in per_sku.items()
+    ]
+
+    # These are full-window snapshots — replace the brand's rows rather than merge.
+    requests.delete(
+        f"{SUPABASE_URL}/rest/v1/amazon_sku_windows",
+        headers=_sb_headers(),
+        params=[("brand", f"eq.{brand}")],
+        timeout=60,
+    )
+    supabase_upsert("amazon_sku_windows", rows)
+
+    total30 = sum(r["units_30"] for r in rows)
+    log.info(f"✓ Amazon sales windows: {len(rows)} SKU(s) (30-day total {total30} units)")
+    print(f"\n  ✓ Amazon sales windows (ending {yesterday}): {len(rows)} SKUs, 30d total {total30} units\n")
 
 
 # ── Shopify (online-store MCF depletion) ───────────────────────────────────────
@@ -1990,7 +2020,7 @@ def main() -> None:
     parser.add_argument("--mcf-orders-only", action="store_true",
                         help="Pull MCF fulfillment orders only (fba_daily_shipped) via Fulfillment Outbound. Skip everything else.")
     parser.add_argument("--amazon-skus-only", action="store_true",
-                        help="Pull Amazon-marketplace units per SKU only (amazon_daily_shipped) via All Orders report. Skip everything else.")
+                        help="Pull Amazon-marketplace units per SKU only (amazon_sku_windows) via Sales & Traffic windows. Skip everything else.")
     args = parser.parse_args()
 
     # ── MCF probe (read-only diagnostic) ────────────────────────────────────────
@@ -2019,23 +2049,10 @@ def main() -> None:
         return
 
     # ── Amazon-SKUs-only mode ───────────────────────────────────────────────────
+    # Always pulls the 7/14/30/60/90 windows ending yesterday (no date range needed).
     if args.amazon_skus_only:
-        if args.start and args.end:
-            log.info("Amazon-SKUs-only backfill mode")
-            fetch_amazon_orders_skus(
-                date.fromisoformat(args.start),
-                date.fromisoformat(args.end),
-                args.brand,
-            )
-        elif args.date:
-            d = date.fromisoformat(args.date)
-            log.info(f"Amazon-SKUs-only single-day mode: {d}")
-            fetch_amazon_orders_skus(d, d, args.brand)
-        else:
-            amz_end   = date.today() - timedelta(days=1)
-            amz_start = date.today() - timedelta(days=_AMZ_ORDERS_LOOKBACK_DAYS)
-            log.info(f"Amazon-SKUs-only mode: last {_AMZ_ORDERS_LOOKBACK_DAYS} days ({amz_start} → {amz_end})")
-            fetch_amazon_orders_skus(amz_start, amz_end, args.brand)
+        log.info("Amazon-SKUs-only mode: Sales & Traffic windows ending yesterday")
+        fetch_amazon_sales_windows(args.brand)
         return
 
     # ── Orders-only mode ────────────────────────────────────────────────────────
@@ -2144,14 +2161,12 @@ def main() -> None:
             log.error(f"MCF orders pull failed (non-fatal): {exc}")
             log.error(traceback.format_exc())
 
-        # Amazon-marketplace units by SKU (All Orders) — the other half of FBA
-        # depletion. Combined with MCF in sku_velocity = total demand. Non-fatal.
+        # Amazon-marketplace units by SKU (Sales & Traffic windows) — the other half of
+        # FBA depletion. Combined with MCF in sku_velocity = total demand. Non-fatal.
         try:
-            amz_end   = date.today() - timedelta(days=1)
-            amz_start = date.today() - timedelta(days=_AMZ_ORDERS_LOOKBACK_DAYS)
-            fetch_amazon_orders_skus(amz_start, amz_end, args.brand)
+            fetch_amazon_sales_windows(args.brand)
         except Exception as exc:
-            log.error(f"Amazon orders-by-SKU pull failed (non-fatal): {exc}")
+            log.error(f"Amazon sales-windows pull failed (non-fatal): {exc}")
             log.error(traceback.format_exc())
 
         # Shopify online-store MCF depletion (the MCF half, sourced directly from Shopify

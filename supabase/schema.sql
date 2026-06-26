@@ -183,76 +183,80 @@ create index if not exists idx_fba_daily_shipped_msku
   on fba_daily_shipped (msku);
 
 
--- ── 5b. amazon_daily_shipped ─────────────────────────────────
--- One row per ship_date per MSKU per brand — units on Amazon-MARKETPLACE orders
--- (Amazon.com), FBA-fulfilled. This is the OTHER half of FBA depletion that the MCF
--- feed (fba_daily_shipped) doesn't include. Sourced from the All Orders report
--- (GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL), filtered to Amazon-fulfilled
--- (AFN) non-cancelled lines. Same shape as fba_daily_shipped so sku_velocity can union them.
+-- ── 5b. amazon_sku_windows ───────────────────────────────────
+-- Amazon-MARKETPLACE units ordered per MSKU, per rolling window (7/14/30/60/90 days
+-- ending yesterday). Sourced from the authoritative Detail Page Sales & Traffic report
+-- (GET_SALES_AND_TRAFFIC_REPORT, child-ASIN granularity) — the same "units ordered"
+-- number you see in Seller Central — mapped ASIN→MSKU via the listings report (1:1).
+-- Stored as pre-computed window totals (not daily) so each window report covers its full
+-- range regardless of how much daily history exists. Combined with MCF in sku_velocity.
 
-create table if not exists amazon_daily_shipped (
-  ship_date  date         not null,
+create table if not exists amazon_sku_windows (
   msku       text         not null,
   brand      varchar(50)  not null default 'xpro',
   asin       varchar(20),
-  units      integer      not null default 0,
+  units_7    integer      not null default 0,
+  units_14   integer      not null default 0,
+  units_30   integer      not null default 0,
+  units_60   integer      not null default 0,
+  units_90   integer      not null default 0,
   updated_at timestamptz  not null default now(),
 
-  primary key (ship_date, msku, brand)
+  primary key (msku, brand)
 );
 
-create or replace trigger amazon_daily_shipped_updated_at
-  before update on amazon_daily_shipped
+create or replace trigger amazon_sku_windows_updated_at
+  before update on amazon_sku_windows
   for each row execute function set_updated_at();
 
-alter table amazon_daily_shipped enable row level security;
+alter table amazon_sku_windows enable row level security;
 
-create policy "authenticated users can read amazon_daily_shipped"
-  on amazon_daily_shipped for select to authenticated using (true);
+create policy "authenticated users can read amazon_sku_windows"
+  on amazon_sku_windows for select to authenticated using (true);
 
-create policy "authenticated users can insert amazon_daily_shipped"
-  on amazon_daily_shipped for insert to authenticated with check (true);
+create policy "authenticated users can insert amazon_sku_windows"
+  on amazon_sku_windows for insert to authenticated with check (true);
 
-create policy "authenticated users can update amazon_daily_shipped"
-  on amazon_daily_shipped for update to authenticated using (true);
+create policy "authenticated users can update amazon_sku_windows"
+  on amazon_sku_windows for update to authenticated using (true);
 
-grant select, insert, update, delete on amazon_daily_shipped to service_role;
-
-create index if not exists idx_amazon_daily_shipped_brand_date
-  on amazon_daily_shipped (brand, ship_date desc);
-
-create index if not exists idx_amazon_daily_shipped_msku
-  on amazon_daily_shipped (msku);
+grant select, insert, update, delete on amazon_sku_windows to service_role;
 
 
 -- ── 6. sku_velocity (view) ───────────────────────────────────
--- Rolling units-shipped windows + average daily velocity per MSKU — TOTAL FBA
--- depletion = Amazon-marketplace orders (amazon_daily_shipped) + MCF/Shopify
--- (fba_daily_shipped), summed per SKU per day. Windows end YESTERDAY
--- ([current_date - N, current_date - 1]) since today's data is incomplete.
+-- TOTAL demand per MSKU over 7/14/30/60/90-day windows ending YESTERDAY =
+--   Amazon-marketplace units ordered (amazon_sku_windows, pre-computed windows)
+--   + MCF/Shopify units (fba_daily_shipped, daily rows windowed here).
+-- Full outer join so a SKU selling on either channel still appears.
 
 create or replace view sku_velocity as
-with combined as (
-  select ship_date, msku, brand, asin, units from fba_daily_shipped
-  union all
-  select ship_date, msku, brand, asin, units from amazon_daily_shipped
+with mcf as (
+  select
+    msku, brand, max(asin) as asin,
+    coalesce(sum(units) filter (where ship_date >= current_date - 7  and ship_date < current_date), 0) as u7,
+    coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) as u14,
+    coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) as u30,
+    coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) as u60,
+    coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) as u90
+  from fba_daily_shipped
+  group by msku, brand
 )
 select
-  msku,
-  brand,
-  max(asin) as asin,
-  coalesce(sum(units) filter (where ship_date >= current_date - 7 and ship_date < current_date),  0) as units_7,
-  coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) as units_14,
-  coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) as units_30,
-  coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) as units_60,
-  coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) as units_90,
-  round(coalesce(sum(units) filter (where ship_date >= current_date - 7 and ship_date < current_date),  0) / 7.0,  2) as vel_7,
-  round(coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) / 14.0, 2) as vel_14,
-  round(coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) / 30.0, 2) as vel_30,
-  round(coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) / 60.0, 2) as vel_60,
-  round(coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) / 90.0, 2) as vel_90
-from combined
-group by msku, brand;
+  coalesce(m.msku, a.msku)   as msku,
+  coalesce(m.brand, a.brand) as brand,
+  coalesce(a.asin, m.asin)   as asin,
+  coalesce(m.u7, 0)  + coalesce(a.units_7, 0)  as units_7,
+  coalesce(m.u14, 0) + coalesce(a.units_14, 0) as units_14,
+  coalesce(m.u30, 0) + coalesce(a.units_30, 0) as units_30,
+  coalesce(m.u60, 0) + coalesce(a.units_60, 0) as units_60,
+  coalesce(m.u90, 0) + coalesce(a.units_90, 0) as units_90,
+  round((coalesce(m.u7, 0)  + coalesce(a.units_7, 0))  / 7.0,  2) as vel_7,
+  round((coalesce(m.u14, 0) + coalesce(a.units_14, 0)) / 14.0, 2) as vel_14,
+  round((coalesce(m.u30, 0) + coalesce(a.units_30, 0)) / 30.0, 2) as vel_30,
+  round((coalesce(m.u60, 0) + coalesce(a.units_60, 0)) / 60.0, 2) as vel_60,
+  round((coalesce(m.u90, 0) + coalesce(a.units_90, 0)) / 90.0, 2) as vel_90
+from mcf m
+full outer join amazon_sku_windows a on a.msku = m.msku and a.brand = m.brand;
 
 grant select on sku_velocity to authenticated, service_role;
 
