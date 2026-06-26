@@ -130,6 +130,14 @@ _SHOPIFY_EXCLUDE_TAG   = os.getenv("SHOPIFY_EXCLUDE_TAG", "Shipped by TikTok")
 _SHOPIFY_LOOKBACK_DAYS = 30   # scheduled-run window (backfill covers the full 90d history)
 _SHOPIFY_OVERWRITE_DAYS = 3   # re-pull/overwrite trailing N days each run for idempotency
 
+# ── MCF orders (Fulfillment Outbound — the working MCF depletion source) ───────
+# The FBA Inventory Ledger report is blocked (report-type-specific 403), but the
+# Fulfillment Outbound API works with the same role. It lists MCF fulfillment orders
+# (your Shopify orders fulfilled from FBA) with SKU + quantity. Only MCF orders appear
+# here — TikTok-from-3PL never touches FBA, so there's nothing to filter out.
+_MCF_LOOKBACK_DAYS  = 14   # scheduled-run window (backfill covers the full 90d history)
+_MCF_OVERWRITE_DAYS = 5    # re-pull/overwrite trailing N days each run for idempotency
+
 _AD_TYPES = [
     {"adProduct": "SPONSORED_PRODUCTS", "reportTypeId": "spCampaigns", "label": "SP"},
     {"adProduct": "SPONSORED_BRANDS",   "reportTypeId": "sbCampaigns", "label": "SB"},
@@ -1416,6 +1424,125 @@ def fetch_mcf_probe(brand: str) -> None:
           f"If this worked, the role is fine and we can pull MCF here.\n")
 
 
+def _mcf_get_order_items(api: FulfillmentOutbound, sfid: str, max_retries: int = 4) -> list[dict]:
+    """Fetch one MCF order's line items, retrying on throttling."""
+    backoff = [2, 5, 10, 20]
+    for attempt in range(max_retries + 1):
+        try:
+            detail = api.get_fulfillment_order(sellerFulfillmentOrderId=sfid).payload or {}
+            return detail.get("fulfillmentOrderItems") or detail.get("FulfillmentOrderItems") or []
+        except Exception as exc:
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+            throttled = code == 429 or "throttl" in str(exc).lower()
+            if throttled and attempt < max_retries:
+                wait = backoff[min(attempt, len(backoff) - 1)]
+                log.warning(f"  Throttled on {sfid} — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            log.warning(f"  Could not fetch items for {sfid}: {exc}")
+            return []
+    return []
+
+
+def fetch_mcf_orders(start: date, end: date, brand: str) -> None:
+    """
+    Pull MCF fulfillment orders (Shopify orders fulfilled from FBA) for [start, end] via
+    the Fulfillment Outbound API, sum units per (ship_date, msku), and upsert into
+    fba_daily_shipped — the off-Amazon half of FBA depletion.
+
+    Why this source: the FBA Inventory Ledger report 403s (report-type-specific), but
+    Fulfillment Outbound works with the same Amazon Fulfillment role. Only MCF orders
+    appear here (TikTok-from-3PL never touches FBA), so no channel filtering is needed —
+    every order genuinely depleted the FBA pool. Bucketed by received date in the seller
+    timezone. Cancelled/invalid orders are skipped.
+
+    Idempotent: deletes + re-inserts the trailing _MCF_OVERWRITE_DAYS days each run.
+    """
+    api = FulfillmentOutbound(credentials=SP_CREDS, marketplace=Marketplaces.US)
+    query_start = start.strftime("%Y-%m-%dT00:00:00Z")
+
+    log.info(f"{'='*60}")
+    log.info(f"MCF ORDERS (Fulfillment Outbound): {start} → {end}  (brand: {brand})")
+    log.info(f"{'='*60}")
+
+    # ── Step 1: list all MCF orders received since `start` (paginated) ──────────
+    summaries: list[dict] = []
+    next_token: str | None = None
+    page = 0
+    while True:
+        page += 1
+        if next_token:
+            resp = api.list_all_fulfillment_orders(nextToken=next_token)
+        else:
+            resp = api.list_all_fulfillment_orders(queryStartDate=query_start)
+        payload = resp.payload or {}
+        batch   = payload.get("fulfillmentOrders") or payload.get("FulfillmentOrders") or []
+        summaries.extend(batch)
+        next_token = payload.get("nextToken") or payload.get("NextToken")
+        log.info(f"  List page {page}: {len(batch)} order(s) (total {len(summaries)})")
+        if not next_token:
+            break
+        time.sleep(1)   # gentle on the list rate limit
+
+    # ── Step 2: filter by date/status, fetch items, aggregate per (date, sku) ───
+    agg: dict[tuple[str, str], int] = {}
+    counted = skipped_cancel = skipped_date = 0
+
+    for o in summaries:
+        status = (o.get("fulfillmentOrderStatus") or o.get("FulfillmentOrderStatus") or "").lower()
+        if status in ("cancelled", "canceled", "invalid"):
+            skipped_cancel += 1
+            continue
+
+        recv = o.get("receivedDate") or o.get("ReceivedDate")
+        if not recv:
+            continue
+        try:
+            utc_dt   = _dt.fromisoformat(recv.replace("Z", "+00:00"))
+            local_dt = utc_dt.astimezone(_SELLER_TZ)
+            date_str = local_dt.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+
+        d = date.fromisoformat(date_str)
+        if d < start or d > end:
+            skipped_date += 1
+            continue
+
+        sfid = o.get("sellerFulfillmentOrderId") or o.get("SellerFulfillmentOrderId")
+        if not sfid:
+            continue
+
+        items = _mcf_get_order_items(api, sfid)
+        for it in items:
+            sku = (it.get("sellerSku") or it.get("SellerSku") or "").strip()
+            qty = it.get("quantity") or it.get("Quantity") or 0
+            if not sku or qty <= 0:
+                continue
+            agg[(date_str, sku)] = agg.get((date_str, sku), 0) + int(qty)
+        counted += 1
+        time.sleep(0.5)   # ~2 req/sec for the per-order detail calls
+
+    rows = [
+        {"ship_date": d, "msku": s, "brand": brand, "units": u}
+        for (d, s), u in agg.items()
+    ]
+
+    overwrite_from = max(start, end - timedelta(days=_MCF_OVERWRITE_DAYS - 1))
+    supabase_delete_range("fba_daily_shipped", brand, overwrite_from, end)
+    log.info(f"  Cleared trailing window {overwrite_from} → {end} for idempotent re-insert")
+
+    supabase_upsert("fba_daily_shipped", rows)
+
+    units_total = sum(r["units"] for r in rows)
+    n_mskus = len({r["msku"] for r in rows})
+    n_days  = len({r["ship_date"] for r in rows})
+    log.info(f"✓ MCF orders: {len(rows)} row(s), {n_mskus} MSKU(s), {units_total} units across {n_days} day(s) "
+             f"| {counted} orders counted, {skipped_cancel} cancelled, {skipped_date} out-of-range")
+    print(f"\n  ✓ MCF orders {start} → {end}: {len(rows)} rows, {n_mskus} MSKUs, "
+          f"{units_total} units (Shopify via MCF)\n")
+
+
 # ── Shopify (online-store MCF depletion) ───────────────────────────────────────
 
 _SHOPIFY_ORDERS_QUERY = """
@@ -1728,11 +1855,33 @@ def main() -> None:
                         help="Pull Shopify online-store MCF units only (shopify_daily_shipped). Skip everything else.")
     parser.add_argument("--mcf-probe", action="store_true",
                         help="Read-only: test whether the Fulfillment Outbound API (MCF orders) is accessible. No DB writes.")
+    parser.add_argument("--mcf-orders-only", action="store_true",
+                        help="Pull MCF fulfillment orders only (fba_daily_shipped) via Fulfillment Outbound. Skip everything else.")
     args = parser.parse_args()
 
     # ── MCF probe (read-only diagnostic) ────────────────────────────────────────
     if args.mcf_probe:
         fetch_mcf_probe(args.brand)
+        return
+
+    # ── MCF-orders-only mode ────────────────────────────────────────────────────
+    if args.mcf_orders_only:
+        if args.start and args.end:
+            log.info("MCF-orders-only backfill mode")
+            fetch_mcf_orders(
+                date.fromisoformat(args.start),
+                date.fromisoformat(args.end),
+                args.brand,
+            )
+        elif args.date:
+            d = date.fromisoformat(args.date)
+            log.info(f"MCF-orders-only single-day mode: {d}")
+            fetch_mcf_orders(d, d, args.brand)
+        else:
+            mcf_end   = date.today() - timedelta(days=1)
+            mcf_start = date.today() - timedelta(days=_MCF_LOOKBACK_DAYS)
+            log.info(f"MCF-orders-only mode: last {_MCF_LOOKBACK_DAYS} days ({mcf_start} → {mcf_end})")
+            fetch_mcf_orders(mcf_start, mcf_end, args.brand)
         return
 
     # ── Orders-only mode ────────────────────────────────────────────────────────
@@ -1830,14 +1979,15 @@ def main() -> None:
         auto_refresh_asin_sessions(args.brand, lookback_days=30) # days with sessions=0 (delayed traffic)
         pull_day(date.today() - timedelta(days=1), args.brand)
 
-        # FBA Inventory Ledger: rolling depletion feed (MCF-inclusive) for forecasting.
-        # Additive — a ledger failure must never break the core daily pull above.
+        # MCF orders (Fulfillment Outbound): off-Amazon FBA depletion — your Shopify
+        # orders fulfilled from FBA. This is the WORKING depletion feed (the ledger
+        # report 403s). Additive and non-fatal so it can't break the core pull.
         try:
-            led_end   = date.today() - timedelta(days=1)
-            led_start = date.today() - timedelta(days=_LEDGER_LOOKBACK_DAYS)
-            fetch_inventory_ledger(led_start, led_end, args.brand)
+            mcf_end   = date.today() - timedelta(days=1)
+            mcf_start = date.today() - timedelta(days=_MCF_LOOKBACK_DAYS)
+            fetch_mcf_orders(mcf_start, mcf_end, args.brand)
         except Exception as exc:
-            log.error(f"Inventory ledger pull failed (non-fatal): {exc}")
+            log.error(f"MCF orders pull failed (non-fatal): {exc}")
             log.error(traceback.format_exc())
 
         # Shopify online-store MCF depletion (the MCF half, sourced directly from Shopify

@@ -47,6 +47,11 @@ on:
         required: false
         type: boolean
         default: false
+      mcf_orders_only:
+        description: 'MCF orders only — populate fba_daily_shipped from Fulfillment Outbound (Shopify orders fulfilled from FBA). The working depletion feed. Skips everything else.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   pull:
@@ -84,6 +89,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.mcf_probe }}" = "true" ]; then
             CMD="$CMD --mcf-probe"
+          fi
+          if [ "${{ github.event.inputs.mcf_orders_only }}" = "true" ]; then
+            CMD="$CMD --mcf-orders-only"
           fi
 
           if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then

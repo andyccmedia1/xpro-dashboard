@@ -72,8 +72,8 @@ export default function Inventory() {
           <h2 className="text-xl font-bold text-white">Inventory Velocity</h2>
           <p className="text-gray-400 text-sm mt-0.5">
             {source === 'ledger'
-              ? <>Units shipped from the FBA pool — Amazon orders <span className="text-gray-300">and</span> MCF combined. The true depletion signal for replenishment.</>
-              : <>Showing <span className="text-emerald-400">Shopify online-store (MCF)</span> units only — the FBA ledger is pending an Amazon permission, so Amazon-marketplace units aren’t merged in yet.</>}
+              ? <>FBA units shipped for <span className="text-emerald-400">off-Amazon (MCF) orders</span> — your Shopify orders fulfilled from Amazon. This is the demand the Amazon sales report can’t see.</>
+              : <>Showing <span className="text-emerald-400">Shopify online-store (MCF)</span> units — your off-Amazon orders fulfilled from FBA.</>}
           </p>
         </div>
 
