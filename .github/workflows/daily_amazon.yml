@@ -32,23 +32,8 @@ on:
         required: false
         type: boolean
         default: false
-      ledger_only:
-        description: 'FBA Inventory Ledger only — populate fba_daily_shipped (MCF-inclusive depletion for replenishment forecasting). Skips everything else.'
-        required: false
-        type: boolean
-        default: false
-      shopify_only:
-        description: 'Shopify online-store MCF units only — populate shopify_daily_shipped (the MCF half of FBA depletion). Skips everything else.'
-        required: false
-        type: boolean
-        default: false
-      mcf_probe:
-        description: 'Read-only test: can we access the Fulfillment Outbound API (MCF orders)? Diagnoses the Amazon Fulfillment role. Writes nothing.'
-        required: false
-        type: boolean
-        default: false
       mcf_orders_only:
-        description: 'MCF orders only — populate fba_daily_shipped from Fulfillment Outbound (Shopify orders fulfilled from FBA). The working depletion feed. Skips everything else.'
+        description: 'MCF orders only — populate fba_daily_shipped from Fulfillment Outbound (Shopify orders fulfilled from FBA). Skips everything else.'
         required: false
         type: boolean
         default: false
@@ -80,15 +65,6 @@ jobs:
           fi
           if [ "${{ github.event.inputs.campaigns_only }}" = "true" ]; then
             CMD="$CMD --campaigns-only"
-          fi
-          if [ "${{ github.event.inputs.ledger_only }}" = "true" ]; then
-            CMD="$CMD --ledger-only"
-          fi
-          if [ "${{ github.event.inputs.shopify_only }}" = "true" ]; then
-            CMD="$CMD --shopify-only"
-          fi
-          if [ "${{ github.event.inputs.mcf_probe }}" = "true" ]; then
-            CMD="$CMD --mcf-probe"
           fi
           if [ "${{ github.event.inputs.mcf_orders_only }}" = "true" ]; then
             CMD="$CMD --mcf-orders-only"
