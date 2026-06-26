@@ -75,7 +75,8 @@ export default function Forecast() {
   const [selected, setSelected] = useState<string | null>(null)
   const [saving,   setSaving]   = useState(false)
 
-  const today = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d }, [])
+  // Anchor to yesterday (the last fully-complete data day) — today's data is partial.
+  const today = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - 1); return d }, [])
 
   const load = useCallback(() => {
     setLoading(true)

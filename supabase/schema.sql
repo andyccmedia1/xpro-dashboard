@@ -193,16 +193,16 @@ select
   msku,
   brand,
   max(asin) as asin,
-  coalesce(sum(units) filter (where ship_date > current_date - 7),  0) as units_7,
-  coalesce(sum(units) filter (where ship_date > current_date - 14), 0) as units_14,
-  coalesce(sum(units) filter (where ship_date > current_date - 30), 0) as units_30,
-  coalesce(sum(units) filter (where ship_date > current_date - 60), 0) as units_60,
-  coalesce(sum(units) filter (where ship_date > current_date - 90), 0) as units_90,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 7),  0) / 7.0,  2) as vel_7,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 14), 0) / 14.0, 2) as vel_14,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 30), 0) / 30.0, 2) as vel_30,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 60), 0) / 60.0, 2) as vel_60,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 90), 0) / 90.0, 2) as vel_90
+  coalesce(sum(units) filter (where ship_date >= current_date - 7 and ship_date < current_date),  0) as units_7,
+  coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) as units_14,
+  coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) as units_30,
+  coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) as units_60,
+  coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) as units_90,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 7 and ship_date < current_date),  0) / 7.0,  2) as vel_7,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) / 14.0, 2) as vel_14,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) / 30.0, 2) as vel_30,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) / 60.0, 2) as vel_60,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) / 90.0, 2) as vel_90
 from fba_daily_shipped
 group by msku, brand;
 
@@ -264,16 +264,16 @@ select
   msku,
   brand,
   null::varchar(20) as asin,
-  coalesce(sum(units) filter (where ship_date > current_date - 7),  0) as units_7,
-  coalesce(sum(units) filter (where ship_date > current_date - 14), 0) as units_14,
-  coalesce(sum(units) filter (where ship_date > current_date - 30), 0) as units_30,
-  coalesce(sum(units) filter (where ship_date > current_date - 60), 0) as units_60,
-  coalesce(sum(units) filter (where ship_date > current_date - 90), 0) as units_90,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 7),  0) / 7.0,  2) as vel_7,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 14), 0) / 14.0, 2) as vel_14,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 30), 0) / 30.0, 2) as vel_30,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 60), 0) / 60.0, 2) as vel_60,
-  round(coalesce(sum(units) filter (where ship_date > current_date - 90), 0) / 90.0, 2) as vel_90
+  coalesce(sum(units) filter (where ship_date >= current_date - 7 and ship_date < current_date),  0) as units_7,
+  coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) as units_14,
+  coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) as units_30,
+  coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) as units_60,
+  coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) as units_90,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 7 and ship_date < current_date),  0) / 7.0,  2) as vel_7,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 14 and ship_date < current_date), 0) / 14.0, 2) as vel_14,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) / 30.0, 2) as vel_30,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) / 60.0, 2) as vel_60,
+  round(coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) / 90.0, 2) as vel_90
 from shopify_daily_shipped
 group by msku, brand;
 
