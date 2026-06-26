@@ -141,8 +141,8 @@ export default function Forecast() {
         <div>
           <h2 className="text-xl font-bold text-white">Inventory Forecast</h2>
           <p className="text-gray-400 text-sm mt-0.5">
-            Velocity auto-loaded from your {source === 'shopify' ? 'Shopify MCF' : 'FBA'} depletion data.
-            Enter on-hand &amp; lead time per SKU to get reorder recommendations.
+            Velocity auto-loaded from {source === 'shopify' ? 'Shopify MCF' : 'total FBA depletion (Amazon + MCF)'} —
+            windows end yesterday. Enter on-hand &amp; lead time per SKU to get reorder recommendations.
           </p>
         </div>
         <div className="flex gap-2 items-center text-xs">

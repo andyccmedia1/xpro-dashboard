@@ -72,7 +72,7 @@ export default function Inventory() {
           <h2 className="text-xl font-bold text-white">Inventory Velocity</h2>
           <p className="text-gray-400 text-sm mt-0.5">
             {source === 'ledger'
-              ? <>FBA units shipped for <span className="text-emerald-400">off-Amazon (MCF) orders</span> — your Shopify orders fulfilled from Amazon. This is the demand the Amazon sales report can’t see.</>
+              ? <>Total FBA depletion per SKU — <span className="text-emerald-400">Amazon-marketplace orders + MCF (Shopify)</span> combined. The true demand signal for replenishment.</>
               : <>Showing <span className="text-emerald-400">Shopify online-store (MCF)</span> units — your off-Amazon orders fulfilled from FBA.</>}
           </p>
         </div>

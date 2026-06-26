@@ -37,6 +37,11 @@ on:
         required: false
         type: boolean
         default: false
+      amazon_skus_only:
+        description: 'Amazon orders by SKU only — populate amazon_daily_shipped from the All Orders report (Amazon-marketplace units). Skips everything else.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   pull:
@@ -68,6 +73,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.mcf_orders_only }}" = "true" ]; then
             CMD="$CMD --mcf-orders-only"
+          fi
+          if [ "${{ github.event.inputs.amazon_skus_only }}" = "true" ]; then
+            CMD="$CMD --amazon-skus-only"
           fi
 
           if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then

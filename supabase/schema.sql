@@ -183,12 +183,60 @@ create index if not exists idx_fba_daily_shipped_msku
   on fba_daily_shipped (msku);
 
 
+-- ── 5b. amazon_daily_shipped ─────────────────────────────────
+-- One row per ship_date per MSKU per brand — units on Amazon-MARKETPLACE orders
+-- (Amazon.com), FBA-fulfilled. This is the OTHER half of FBA depletion that the MCF
+-- feed (fba_daily_shipped) doesn't include. Sourced from the All Orders report
+-- (GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL), filtered to Amazon-fulfilled
+-- (AFN) non-cancelled lines. Same shape as fba_daily_shipped so sku_velocity can union them.
+
+create table if not exists amazon_daily_shipped (
+  ship_date  date         not null,
+  msku       text         not null,
+  brand      varchar(50)  not null default 'xpro',
+  asin       varchar(20),
+  units      integer      not null default 0,
+  updated_at timestamptz  not null default now(),
+
+  primary key (ship_date, msku, brand)
+);
+
+create or replace trigger amazon_daily_shipped_updated_at
+  before update on amazon_daily_shipped
+  for each row execute function set_updated_at();
+
+alter table amazon_daily_shipped enable row level security;
+
+create policy "authenticated users can read amazon_daily_shipped"
+  on amazon_daily_shipped for select to authenticated using (true);
+
+create policy "authenticated users can insert amazon_daily_shipped"
+  on amazon_daily_shipped for insert to authenticated with check (true);
+
+create policy "authenticated users can update amazon_daily_shipped"
+  on amazon_daily_shipped for update to authenticated using (true);
+
+grant select, insert, update, delete on amazon_daily_shipped to service_role;
+
+create index if not exists idx_amazon_daily_shipped_brand_date
+  on amazon_daily_shipped (brand, ship_date desc);
+
+create index if not exists idx_amazon_daily_shipped_msku
+  on amazon_daily_shipped (msku);
+
+
 -- ── 6. sku_velocity (view) ───────────────────────────────────
--- Rolling units-shipped windows + average daily velocity per MSKU.
--- Drives replenishment forecasting (units/day × lead time = reorder need).
--- Windows use `ship_date > current_date - N` so they always reflect the last N days.
+-- Rolling units-shipped windows + average daily velocity per MSKU — TOTAL FBA
+-- depletion = Amazon-marketplace orders (amazon_daily_shipped) + MCF/Shopify
+-- (fba_daily_shipped), summed per SKU per day. Windows end YESTERDAY
+-- ([current_date - N, current_date - 1]) since today's data is incomplete.
 
 create or replace view sku_velocity as
+with combined as (
+  select ship_date, msku, brand, asin, units from fba_daily_shipped
+  union all
+  select ship_date, msku, brand, asin, units from amazon_daily_shipped
+)
 select
   msku,
   brand,
@@ -203,7 +251,7 @@ select
   round(coalesce(sum(units) filter (where ship_date >= current_date - 30 and ship_date < current_date), 0) / 30.0, 2) as vel_30,
   round(coalesce(sum(units) filter (where ship_date >= current_date - 60 and ship_date < current_date), 0) / 60.0, 2) as vel_60,
   round(coalesce(sum(units) filter (where ship_date >= current_date - 90 and ship_date < current_date), 0) / 90.0, 2) as vel_90
-from fba_daily_shipped
+from combined
 group by msku, brand;
 
 grant select on sku_velocity to authenticated, service_role;
