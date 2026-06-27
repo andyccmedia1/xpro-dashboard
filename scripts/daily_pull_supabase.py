@@ -1570,6 +1570,23 @@ def _sp_create_report_retry(api: Reports, max_retries: int = 6, **kwargs):
             raise
 
 
+def _fetch_sku_map(brand: str) -> dict[str, str]:
+    """User-maintained ASIN→canonical-SKU overrides (sku_map). Wins over the listings
+    report, for products whose Amazon listing SKU differs from the canonical SKU."""
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/sku_map",
+            headers={"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"},
+            params=[("brand", f"eq.{brand}"), ("select", "asin,msku")],
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return {r["asin"]: r["msku"] for r in resp.json() if r.get("asin") and r.get("msku")}
+    except Exception as exc:
+        log.warning(f"  Could not load sku_map overrides: {exc}")
+        return {}
+
+
 def _pull_listings_asin_sku_map() -> dict[str, str]:
     """
     Pull GET_MERCHANT_LISTINGS_ALL_DATA → {asin: seller_sku}. Catalog is 1:1 ASIN↔SKU,
@@ -1633,6 +1650,10 @@ def fetch_amazon_sales_windows(brand: str) -> None:
     log.info(f"{'='*60}")
 
     asin_sku = _pull_listings_asin_sku_map()
+    overrides = _fetch_sku_map(brand)   # user-maintained ASIN→canonical-SKU, wins over listings
+    if overrides:
+        asin_sku.update(overrides)
+        log.info(f"  Applied {len(overrides)} sku_map override(s)")
     sku_asin = {sku: asin for asin, sku in asin_sku.items()}
 
     api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
