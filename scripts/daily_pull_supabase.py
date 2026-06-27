@@ -1589,22 +1589,23 @@ def _fetch_sku_map(brand: str) -> dict[str, str]:
 
 def _pull_listings_asin_sku_map() -> dict[str, str]:
     """
-    Pull GET_MERCHANT_LISTINGS_ALL_DATA → {asin: seller_sku}. Catalog is 1:1 ASIN↔SKU,
-    so the inverse map is unambiguous. Used to key the (child-ASIN) Sales & Traffic
-    numbers by MSKU.
+    Pull the ACTIVE listings report (GET_MERCHANT_LISTINGS_DATA) → {asin: seller_sku}.
+    Active-only avoids stale/ghost duplicate listings — the "All Listings" report includes
+    old inactive SKUs for the same ASIN, which mis-mapped some products. Used to key the
+    (child-ASIN) Sales & Traffic numbers by canonical MSKU.
     """
     api = Reports(credentials=SP_CREDS, marketplace=Marketplaces.US)
     marketplace_ids = [m.strip() for m in SP_MARKETPLACE_ID.split(",") if m.strip()]
     try:
         resp = _sp_create_report_retry(
             api,
-            reportType="GET_MERCHANT_LISTINGS_ALL_DATA",
+            reportType="GET_MERCHANT_LISTINGS_DATA",
             marketplaceIds=marketplace_ids,
         )
     except Exception as exc:
         hdrs   = getattr(exc, "headers", None) or {}
         req_id = hdrs.get("x-amzn-RequestId") or hdrs.get("x-amzn-requestid") or "unknown"
-        log.error(f"create_report failed for GET_MERCHANT_LISTINGS_ALL_DATA: {type(exc).__name__}: {exc}")
+        log.error(f"create_report failed for GET_MERCHANT_LISTINGS_DATA: {type(exc).__name__}: {exc}")
         log.error(f"  → If 403: token lacks listings-report access. Amazon request id: {req_id}")
         raise
 
