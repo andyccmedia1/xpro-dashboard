@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
 } from 'recharts'
@@ -74,6 +74,12 @@ export default function Forecast() {
   const [edits,    setEdits]    = useState<Record<string, Partial<Sku>>>({})
   const [selected, setSelected] = useState<string | null>(null)
   const [saving,   setSaving]   = useState(false)
+  const detailRef = useRef<HTMLDivElement>(null)
+
+  // Scroll the detail panel into view when a SKU is selected (it renders below the table)
+  useEffect(() => {
+    if (selected) detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [selected])
 
   // Anchor to yesterday (the last fully-complete data day) — today's data is partial.
   const today = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - 1); return d }, [])
@@ -261,7 +267,7 @@ export default function Forecast() {
 
           {/* ── Detail panel ──────────────────────────────────── */}
           {sel && (
-            <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-5">
+            <div ref={detailRef} className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-5">
               <div className="flex items-start justify-between">
                 <div>
                   <h3 className="text-white font-semibold">{sel.sku.msku}</h3>
