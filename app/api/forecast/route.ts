@@ -32,7 +32,7 @@ export async function GET(request: Request) {
 
   const { data: params } = await supabase
     .from('sku_params')
-    .select('msku, on_hand, inbound_qty, inbound_days, lead_time_days, safety_stock_days, moq, casepack, cycle_cover_days')
+    .select('msku, on_hand, inbound_qty, inbound_days, inbound_date, lead_time_days, safety_stock_days, moq, casepack, cycle_cover_days')
     .eq('brand', brand)
 
   const paramMap = new Map<string, Record<string, unknown>>()
@@ -47,7 +47,7 @@ export async function GET(request: Request) {
       units_7: num(r.units_7), units_14: num(r.units_14), units_30: num(r.units_30), units_60: num(r.units_60), units_90: num(r.units_90),
       on_hand:           num(p.on_hand ?? DEFAULTS.on_hand),
       inbound_qty:       num(p.inbound_qty ?? DEFAULTS.inbound_qty),
-      inbound_days:      num(p.inbound_days ?? DEFAULTS.inbound_days),
+      inbound_date:      (p.inbound_date as string | null) ?? null,
       lead_time_days:    num(p.lead_time_days ?? DEFAULTS.lead_time_days),
       safety_stock_days: num(p.safety_stock_days ?? DEFAULTS.safety_stock_days),
       moq:               num(p.moq ?? DEFAULTS.moq),
@@ -71,7 +71,7 @@ export async function POST(request: Request) {
     msku:              String(body.msku),
     on_hand:           Math.round(num(body.on_hand)),
     inbound_qty:       Math.round(num(body.inbound_qty)),
-    inbound_days:      Math.round(num(body.inbound_days)),
+    inbound_date:      body.inbound_date ? String(body.inbound_date) : null,
     lead_time_days:    Math.round(num(body.lead_time_days ?? DEFAULTS.lead_time_days)),
     safety_stock_days: Math.round(num(body.safety_stock_days ?? DEFAULTS.safety_stock_days)),
     moq:               Math.round(num(body.moq)),

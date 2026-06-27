@@ -345,7 +345,8 @@ create table if not exists sku_params (
   brand             varchar(50)  not null default 'xpro',
   on_hand           integer      not null default 0,    -- current FBA on-hand units
   inbound_qty       integer      not null default 0,    -- a scheduled inbound shipment
-  inbound_days      integer      not null default 0,    -- days until that inbound arrives
+  inbound_days      integer      not null default 0,    -- (legacy) days until inbound arrives
+  inbound_date      date,                                -- inbound arrival date (preferred over inbound_days)
   lead_time_days    integer      not null default 80,   -- reorder lead time
   safety_stock_days integer      not null default 15,   -- days of safety stock
   moq               integer      not null default 0,    -- minimum order quantity

@@ -15,7 +15,7 @@ type Sku = {
   asin: string | null
   v7: number; v14: number; v30: number; v60: number; v90: number
   units_7: number; units_14: number; units_30: number; units_60: number; units_90: number
-  on_hand: number; inbound_qty: number; inbound_days: number
+  on_hand: number; inbound_qty: number; inbound_date: string | null
   lead_time_days: number; safety_stock_days: number
   moq: number; casepack: number; cycle_cover_days: number
   has_params: boolean
@@ -23,25 +23,36 @@ type Sku = {
 
 type Policy = 'R_S' | 's_Q' | 'EOQ'
 
-// Editable param fields
+// Editable param fields ('date' renders a calendar input, others are numbers)
 const PARAM_FIELDS = [
-  { key: 'on_hand',           label: 'On-hand units' },
-  { key: 'inbound_qty',       label: 'Inbound qty' },
-  { key: 'inbound_days',      label: 'Inbound arrives (days)' },
-  { key: 'lead_time_days',    label: 'Lead time (days)' },
-  { key: 'safety_stock_days', label: 'Safety stock (days)' },
-  { key: 'cycle_cover_days',  label: 'Cycle coverage (days)' },
-  { key: 'moq',               label: 'MOQ' },
-  { key: 'casepack',          label: 'Casepack' },
+  { key: 'on_hand',           label: 'On-hand units',       type: 'number' },
+  { key: 'inbound_qty',       label: 'Inbound qty',         type: 'number' },
+  { key: 'inbound_date',      label: 'Inbound arrives',     type: 'date'   },
+  { key: 'lead_time_days',    label: 'Lead time (days)',    type: 'number' },
+  { key: 'safety_stock_days', label: 'Safety stock (days)', type: 'number' },
+  { key: 'cycle_cover_days',  label: 'Cycle coverage (days)', type: 'number' },
+  { key: 'moq',               label: 'MOQ',                 type: 'number' },
+  { key: 'casepack',          label: 'Casepack',            type: 'number' },
 ] as const
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const n0 = (v: number) => (Number.isFinite(v) ? Math.round(v).toLocaleString() : '—')
 const n2 = (v: number) => (Number.isFinite(v) ? v.toFixed(2) : '—')
 
+const DAY_MS = 86_400_000
+/** Whole days from the forecast anchor to an inbound date (null/past → null). */
+function inboundDayOffset(inboundDate: string | null, anchor: Date): number | null {
+  if (!inboundDate) return null
+  const d = new Date(inboundDate + 'T00:00:00')
+  if (isNaN(d.getTime())) return null
+  const offset = Math.round((d.getTime() - anchor.getTime()) / DAY_MS)
+  return offset >= 0 ? offset : null
+}
+
 function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date) {
   const base = weightedVelocity({ v7: sku.v7, v14: sku.v14, v30: sku.v30, v60: sku.v60, v90: sku.v90 }, weights)
-  const deliveries = sku.inbound_qty > 0 ? [{ day: sku.inbound_days, qty: sku.inbound_qty }] : []
+  const inDay = inboundDayOffset(sku.inbound_date, today)
+  const deliveries = sku.inbound_qty > 0 && inDay != null ? [{ day: inDay, qty: sku.inbound_qty }] : []
   const rows = runForecast({
     initialInventory: sku.on_hand,
     baseVelocity: base,
@@ -112,7 +123,7 @@ export default function Forecast() {
 
   const sel = computed.find(c => c.sku.msku === selected) ?? null
 
-  function setEdit(msku: string, key: keyof Sku, value: number) {
+  function setEdit(msku: string, key: keyof Sku, value: number | string | null) {
     setEdits(e => ({ ...e, [msku]: { ...e[msku], [key]: value } }))
   }
 
@@ -124,7 +135,7 @@ export default function Forecast() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           msku: s.msku,
-          on_hand: s.on_hand, inbound_qty: s.inbound_qty, inbound_days: s.inbound_days,
+          on_hand: s.on_hand, inbound_qty: s.inbound_qty, inbound_date: s.inbound_date,
           lead_time_days: s.lead_time_days, safety_stock_days: s.safety_stock_days,
           moq: s.moq, casepack: s.casepack, cycle_cover_days: s.cycle_cover_days,
         }),
@@ -284,12 +295,21 @@ export default function Forecast() {
                 {PARAM_FIELDS.map(f => (
                   <div key={f.key}>
                     <label className="block text-xs text-gray-500 mb-1">{f.label}</label>
-                    <input
-                      type="number" min={0}
-                      value={(sel.sku as Sku)[f.key] as number}
-                      onChange={e => setEdit(sel.sku.msku, f.key, Math.max(0, parseFloat(e.target.value) || 0))}
-                      className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
-                    />
+                    {f.type === 'date' ? (
+                      <input
+                        type="date"
+                        value={(sel.sku.inbound_date as string | null) ?? ''}
+                        onChange={e => setEdit(sel.sku.msku, 'inbound_date', e.target.value || null)}
+                        className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                      />
+                    ) : (
+                      <input
+                        type="number" min={0}
+                        value={(sel.sku as Sku)[f.key] as number}
+                        onChange={e => setEdit(sel.sku.msku, f.key, Math.max(0, parseFloat(e.target.value) || 0))}
+                        className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                      />
+                    )}
                   </div>
                 ))}
               </div>
