@@ -10,12 +10,14 @@ import {
 } from '@/lib/forecast'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
+type Inbound = { date: string; qty: number }
+
 type Sku = {
   msku: string
   asin: string | null
   v7: number; v14: number; v30: number; v60: number; v90: number
   units_7: number; units_14: number; units_30: number; units_60: number; units_90: number
-  on_hand: number; inbound_qty: number; inbound_date: string | null
+  on_hand: number; inbounds: Inbound[]
   lead_time_days: number; safety_stock_days: number
   moq: number; casepack: number; cycle_cover_days: number
   has_params: boolean
@@ -23,16 +25,14 @@ type Sku = {
 
 type Policy = 'R_S' | 's_Q' | 'EOQ'
 
-// Editable param fields ('date' renders a calendar input, others are numbers)
+// Scalar editable params (inbound shipments are edited in their own list section)
 const PARAM_FIELDS = [
-  { key: 'on_hand',           label: 'On-hand units',       type: 'number' },
-  { key: 'inbound_qty',       label: 'Inbound qty',         type: 'number' },
-  { key: 'inbound_date',      label: 'Inbound arrives',     type: 'date'   },
-  { key: 'lead_time_days',    label: 'Lead time (days)',    type: 'number' },
-  { key: 'safety_stock_days', label: 'Safety stock (days)', type: 'number' },
-  { key: 'cycle_cover_days',  label: 'Cycle coverage (days)', type: 'number' },
-  { key: 'moq',               label: 'MOQ',                 type: 'number' },
-  { key: 'casepack',          label: 'Casepack',            type: 'number' },
+  { key: 'on_hand',           label: 'On-hand units' },
+  { key: 'lead_time_days',    label: 'Lead time (days)' },
+  { key: 'safety_stock_days', label: 'Safety stock (days)' },
+  { key: 'cycle_cover_days',  label: 'Cycle coverage (days)' },
+  { key: 'moq',               label: 'MOQ' },
+  { key: 'casepack',          label: 'Casepack' },
 ] as const
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -51,8 +51,9 @@ function inboundDayOffset(inboundDate: string | null, anchor: Date): number | nu
 
 function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date) {
   const base = weightedVelocity({ v7: sku.v7, v14: sku.v14, v30: sku.v30, v60: sku.v60, v90: sku.v90 }, weights)
-  const inDay = inboundDayOffset(sku.inbound_date, today)
-  const deliveries = sku.inbound_qty > 0 && inDay != null ? [{ day: inDay, qty: sku.inbound_qty }] : []
+  const deliveries = (sku.inbounds ?? [])
+    .map(s => ({ day: inboundDayOffset(s.date, today), qty: s.qty }))
+    .filter((d): d is { day: number; qty: number } => d.day != null && d.qty > 0)
   const rows = runForecast({
     initialInventory: sku.on_hand,
     baseVelocity: base,
@@ -123,9 +124,15 @@ export default function Forecast() {
 
   const sel = computed.find(c => c.sku.msku === selected) ?? null
 
-  function setEdit(msku: string, key: keyof Sku, value: number | string | null) {
+  function setEdit(msku: string, key: keyof Sku, value: number | string | null | Inbound[]) {
     setEdits(e => ({ ...e, [msku]: { ...e[msku], [key]: value } }))
   }
+  // Inbound shipment list editors
+  const setInbounds = (s: Sku, list: Inbound[]) => setEdit(s.msku, 'inbounds', list)
+  const addInbound    = (s: Sku) => setInbounds(s, [...(s.inbounds ?? []), { date: '', qty: 0 }])
+  const removeInbound = (s: Sku, i: number) => setInbounds(s, (s.inbounds ?? []).filter((_, idx) => idx !== i))
+  const updateInbound = (s: Sku, i: number, field: keyof Inbound, value: string | number) =>
+    setInbounds(s, (s.inbounds ?? []).map((sh, idx) => (idx === i ? { ...sh, [field]: value } : sh)))
 
   async function saveParams(s: Sku) {
     setSaving(true)
@@ -135,7 +142,7 @@ export default function Forecast() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           msku: s.msku,
-          on_hand: s.on_hand, inbound_qty: s.inbound_qty, inbound_date: s.inbound_date,
+          on_hand: s.on_hand, inbounds: s.inbounds,
           lead_time_days: s.lead_time_days, safety_stock_days: s.safety_stock_days,
           moq: s.moq, casepack: s.casepack, cycle_cover_days: s.cycle_cover_days,
         }),
@@ -290,28 +297,54 @@ export default function Forecast() {
                 <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 text-sm">✕</button>
               </div>
 
-              {/* Editable params */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {/* Scalar params */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
                 {PARAM_FIELDS.map(f => (
                   <div key={f.key}>
                     <label className="block text-xs text-gray-500 mb-1">{f.label}</label>
-                    {f.type === 'date' ? (
-                      <input
-                        type="date"
-                        value={(sel.sku.inbound_date as string | null) ?? ''}
-                        onChange={e => setEdit(sel.sku.msku, 'inbound_date', e.target.value || null)}
-                        className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
-                      />
-                    ) : (
-                      <input
-                        type="number" min={0}
-                        value={(sel.sku as Sku)[f.key] as number}
-                        onChange={e => setEdit(sel.sku.msku, f.key, Math.max(0, parseFloat(e.target.value) || 0))}
-                        className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
-                      />
-                    )}
+                    <input
+                      type="number" min={0}
+                      value={(sel.sku as Sku)[f.key] as number}
+                      onChange={e => setEdit(sel.sku.msku, f.key, Math.max(0, parseFloat(e.target.value) || 0))}
+                      className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                    />
                   </div>
                 ))}
+              </div>
+
+              {/* Inbound shipments (multiple qty + arrival date) */}
+              <div className="border-t border-gray-800 pt-4">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Inbound shipments</label>
+                  <button onClick={() => addInbound(sel.sku)} className="text-xs font-medium text-indigo-400 hover:text-indigo-300">
+                    + Add shipment
+                  </button>
+                </div>
+                {(sel.sku.inbounds ?? []).length === 0 ? (
+                  <p className="text-xs text-gray-600">No inbound shipments. Add one to model incoming stock arriving on a date.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {(sel.sku.inbounds ?? []).map((sh, i) => (
+                      <div key={i} className="flex items-center gap-2">
+                        <input
+                          type="number" min={0} placeholder="qty"
+                          value={sh.qty || ''}
+                          onChange={e => updateInbound(sel.sku, i, 'qty', Math.max(0, parseFloat(e.target.value) || 0))}
+                          className="w-28 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                        />
+                        <span className="text-xs text-gray-600">units arriving</span>
+                        <input
+                          type="date"
+                          value={sh.date}
+                          onChange={e => updateInbound(sel.sku, i, 'date', e.target.value)}
+                          className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                        />
+                        <button onClick={() => removeInbound(sel.sku, i)}
+                                className="text-gray-500 hover:text-rose-400 text-sm px-1" title="Remove">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div className="flex items-center gap-3">

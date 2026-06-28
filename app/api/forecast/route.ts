@@ -32,7 +32,7 @@ export async function GET(request: Request) {
 
   const { data: params } = await supabase
     .from('sku_params')
-    .select('msku, on_hand, inbound_qty, inbound_days, inbound_date, lead_time_days, safety_stock_days, moq, casepack, cycle_cover_days')
+    .select('msku, on_hand, inbounds, lead_time_days, safety_stock_days, moq, casepack, cycle_cover_days')
     .eq('brand', brand)
 
   const paramMap = new Map<string, Record<string, unknown>>()
@@ -46,8 +46,7 @@ export async function GET(request: Request) {
       v7: num(r.vel_7), v14: num(r.vel_14), v30: num(r.vel_30), v60: num(r.vel_60), v90: num(r.vel_90),
       units_7: num(r.units_7), units_14: num(r.units_14), units_30: num(r.units_30), units_60: num(r.units_60), units_90: num(r.units_90),
       on_hand:           num(p.on_hand ?? DEFAULTS.on_hand),
-      inbound_qty:       num(p.inbound_qty ?? DEFAULTS.inbound_qty),
-      inbound_date:      (p.inbound_date as string | null) ?? null,
+      inbounds:          Array.isArray(p.inbounds) ? p.inbounds : [],
       lead_time_days:    num(p.lead_time_days ?? DEFAULTS.lead_time_days),
       safety_stock_days: num(p.safety_stock_days ?? DEFAULTS.safety_stock_days),
       moq:               num(p.moq ?? DEFAULTS.moq),
@@ -66,12 +65,21 @@ export async function POST(request: Request) {
   const body = await request.json().catch(() => null)
   if (!body?.msku) return NextResponse.json({ error: 'msku is required' }, { status: 400 })
 
+  // Sanitise the inbound shipments list: [{date:'YYYY-MM-DD', qty:int}, …]
+  const inbounds = Array.isArray(body.inbounds)
+    ? body.inbounds
+        .map((s: { date?: unknown; qty?: unknown }) => ({
+          date: s.date ? String(s.date) : '',
+          qty:  Math.round(num(s.qty)),
+        }))
+        .filter((s: { date: string; qty: number }) => s.date && s.qty > 0)
+    : []
+
   const row = {
     brand:             body.brand ?? 'xpro',
     msku:              String(body.msku),
     on_hand:           Math.round(num(body.on_hand)),
-    inbound_qty:       Math.round(num(body.inbound_qty)),
-    inbound_date:      body.inbound_date ? String(body.inbound_date) : null,
+    inbounds,
     lead_time_days:    Math.round(num(body.lead_time_days ?? DEFAULTS.lead_time_days)),
     safety_stock_days: Math.round(num(body.safety_stock_days ?? DEFAULTS.safety_stock_days)),
     moq:               Math.round(num(body.moq)),
