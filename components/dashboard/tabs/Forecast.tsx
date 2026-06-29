@@ -21,6 +21,7 @@ type Sku = {
   lead_time_days: number; lead_time_std_days: number; safety_stock_days: number
   moq: number; casepack: number; cycle_cover_days: number
   seasonality: number[]   // per-SKU override: 12 monthly multipliers, or [] = use global
+  demand_cv: number       // per-SKU demand CV override; 0 = use global
   has_params: boolean
 }
 
@@ -89,7 +90,8 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
     .map(s => ({ day: inboundDayOffset(s.date, today), qty: s.qty }))
     .filter((d): d is { day: number; qty: number } => d.day != null && d.qty > 0)
   const useService = safety.method === 'service'
-  const sigmaD = safety.cv * base   // daily demand std as a fraction of velocity
+  const cv = sku.demand_cv > 0 ? sku.demand_cv : safety.cv   // per-SKU override else global
+  const sigmaD = cv * base          // daily demand std as a fraction of velocity
   // Per-SKU curve overrides the global one; global toggle still gates whether any applies.
   const effFactors = sku.seasonality?.length === 12 ? sku.seasonality : season.factors
   const seasonalityFactors = seasonalityMap({ on: season.on, factors: effFactors }, today)
@@ -119,7 +121,7 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
   const safetyStock = useService
     ? safety.z * Math.sqrt(sigmaD * sigmaD * sku.lead_time_days + base * base * sku.lead_time_std_days * sku.lead_time_std_days)
     : base * sku.safety_stock_days
-  return { base, rows, analytics, daysOfCover, safetyStock }
+  return { base, rows, analytics, daysOfCover, safetyStock, cv }
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -167,6 +169,8 @@ export default function Forecast() {
   const [selected, setSelected] = useState<string | null>(null)
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [saveErr,   setSaveErr]   = useState('')
+  const [cvBusy,    setCvBusy]    = useState<string | null>(null)   // msku currently calculating CV
+  const [cvInfo,    setCvInfo]    = useState<Record<string, { cv: number; days: number; mean: number; std: number } | string>>({})
   const detailRef = useRef<HTMLDivElement>(null)
 
   // Scroll the detail panel into view when a SKU is selected (it renders below the table)
@@ -225,6 +229,27 @@ export default function Forecast() {
     setEdit(s.msku, 'seasonality',
       (s.seasonality?.length === 12 ? s.seasonality : seasonFactors).map((x, idx) => (idx === i ? Math.max(0, v) : x)))
 
+  // Compute this SKU's demand CV from its own daily history (Amazon + MCF) and
+  // set it as a per-SKU override (auto-saves via setEdit).
+  async function calcCv(s: Sku) {
+    setCvBusy(s.msku)
+    try {
+      const r = await fetch(`/api/forecast/cv?msku=${encodeURIComponent(s.msku)}`)
+      const d = await r.json()
+      if (!r.ok) {
+        setCvInfo(prev => ({ ...prev, [s.msku]: d.error === 'not enough daily history'
+          ? `Not enough history (${d.days ?? 0} days)` : (d.error || 'Could not calculate') }))
+      } else {
+        setEdit(s.msku, 'demand_cv', d.cv)
+        setCvInfo(prev => ({ ...prev, [s.msku]: { cv: d.cv, days: d.days, mean: d.mean, std: d.std } }))
+      }
+    } catch {
+      setCvInfo(prev => ({ ...prev, [s.msku]: 'Could not calculate' }))
+    } finally {
+      setCvBusy(null)
+    }
+  }
+
   // Refs so saveSku always reads the latest state without being re-created
   // (a stable identity keeps the auto-save effect from looping).
   const editsRef = useRef(edits); editsRef.current = edits
@@ -253,7 +278,7 @@ export default function Forecast() {
           lead_time_days: merged.lead_time_days, lead_time_std_days: merged.lead_time_std_days,
           safety_stock_days: merged.safety_stock_days,
           moq: merged.moq, casepack: merged.casepack, cycle_cover_days: merged.cycle_cover_days,
-          seasonality: merged.seasonality,
+          seasonality: merged.seasonality, demand_cv: merged.demand_cv,
         }),
       })
       if (!res.ok) {
@@ -563,6 +588,51 @@ export default function Forecast() {
                 )}
               </div>
 
+              {/* Demand variability (CV) — used by the service-level safety method */}
+              <div className="border-t border-gray-800 pt-4">
+                <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Demand variability · CV</label>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => calcCv(sel.sku)}
+                      disabled={cvBusy === sel.sku.msku}
+                      className="text-xs font-medium text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+                    >
+                      {cvBusy === sel.sku.msku ? 'Calculating…' : '↻ Calculate from history'}
+                    </button>
+                    {sel.sku.demand_cv > 0 && (
+                      <button
+                        onClick={() => { setEdit(sel.sku.msku, 'demand_cv', 0); setCvInfo(prev => { const c = { ...prev }; delete c[sel.sku.msku]; return c }) }}
+                        className="text-xs text-gray-500 hover:text-rose-400"
+                      >
+                        use global
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <input
+                    type="number" min={0} max={3} step={0.05}
+                    value={sel.sku.demand_cv > 0 ? sel.sku.demand_cv : demandCv}
+                    onChange={e => setEdit(sel.sku.msku, 'demand_cv', Math.max(0, parseFloat(e.target.value) || 0))}
+                    className="w-24 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white text-center"
+                  />
+                  <span className="text-xs text-gray-500">
+                    {sel.sku.demand_cv > 0 ? 'custom (this SKU)' : `inherited from global (${demandCv})`}
+                  </span>
+                  {(() => {
+                    const info = cvInfo[sel.sku.msku]
+                    if (!info) return null
+                    if (typeof info === 'string') return <span className="text-xs text-amber-400">{info}</span>
+                    return <span className="text-xs text-gray-400">From {info.days} days: mean {n0(info.mean)}/day · σ {n0(info.std)}/day → CV {info.cv}</span>
+                  })()}
+                </div>
+                <p className="text-xs text-gray-600 mt-1">
+                  Daily demand swing as a fraction of average (Amazon + MCF). Used by the <span className="text-gray-400">Service-level</span> safety method
+                  {safetyMethod !== 'service' ? ' — currently off; switch “Safety stock” to Service level to apply' : ''}.
+                </p>
+              </div>
+
               {/* Per-SKU seasonality override */}
               <div className="border-t border-gray-800 pt-4">
                 <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
@@ -633,7 +703,8 @@ export default function Forecast() {
               {/* Safety stock readout */}
               <p className="text-xs text-gray-500">
                 {safetyMethod === 'service' ? (
-                  <>Safety stock <span className="text-gray-300">{n0(sel.safetyStock)} units</span> @ {serviceLvl}% service —
+                  <>Safety stock <span className="text-gray-300">{n0(sel.safetyStock)} units</span> @ {serviceLvl}% service ·
+                    CV <span className="text-gray-300">{n2(sel.cv)}</span>{sel.sku.demand_cv > 0 && <span className="text-gray-600"> (custom)</span>} —
                     includes <span className="text-amber-400">±{sel.sku.lead_time_std_days}d lead-time risk</span> ·
                     reorder point <span className="text-gray-300">{n0(sel.rows[0]?.reorderPoint ?? 0)}</span></>
                 ) : (
