@@ -29,6 +29,17 @@ type SafetyMethod = 'days' | 'service'
 // Service-level → z-score
 const Z: Record<string, number> = { '90': 1.28, '95': 1.65, '97': 1.88, '99': 2.33 }
 
+// Seasonality: month labels, localStorage key, and a few starter curves (Jan..Dec)
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
+const SEASON_KEY = 'xpro_forecast_seasonality'
+const SEASON_PRESETS: Record<string, number[]> = {
+  Flat:          [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  // E-commerce Q4 lift: soft Q1, build into Black Friday / December
+  'Q4 holiday':  [0.85, 0.85, 0.9, 0.95, 1, 1, 1.05, 1, 1, 1.15, 1.6, 1.7],
+  // Summer-peak (outdoor/seasonal goods)
+  'Summer peak': [0.8, 0.8, 0.9, 1.1, 1.3, 1.5, 1.5, 1.3, 1.1, 0.9, 0.8, 0.8],
+}
+
 // Scalar editable params (inbound shipments are edited in their own list section)
 const PARAM_FIELDS = [
   { key: 'on_hand',            label: 'On-hand units' },
@@ -55,14 +66,30 @@ function inboundDayOffset(inboundDate: string | null, anchor: Date): number | nu
 }
 
 type Safety = { method: SafetyMethod; z: number; cv: number }
+// 12 monthly multipliers (Jan..Dec). on=false → flat demand.
+type Seasonality = { on: boolean; factors: number[] }
 
-function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety) {
+// Build the engine's month→multiplier map, normalised so the CURRENT month = 1.0.
+// baseVelocity already reflects the current month's run-rate (trailing windows),
+// so anchoring the current month to 1.0 keeps day-0 demand equal to baseVelocity
+// and scales every other month relative to it.
+function seasonalityMap(season: Seasonality, today: Date): Record<number, number> | undefined {
+  if (!season.on) return undefined
+  const cur = today.getMonth()                  // 0-11
+  const anchor = season.factors[cur] || 1
+  const map: Record<number, number> = {}
+  for (let m = 0; m < 12; m++) map[m + 1] = (season.factors[m] || 0) / (anchor || 1)
+  return map
+}
+
+function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety, season: Seasonality) {
   const base = weightedVelocity({ v7: sku.v7, v14: sku.v14, v30: sku.v30, v60: sku.v60, v90: sku.v90 }, weights)
   const deliveries = (sku.inbounds ?? [])
     .map(s => ({ day: inboundDayOffset(s.date, today), qty: s.qty }))
     .filter((d): d is { day: number; qty: number } => d.day != null && d.qty > 0)
   const useService = safety.method === 'service'
   const sigmaD = safety.cv * base   // daily demand std as a fraction of velocity
+  const seasonalityFactors = seasonalityMap(season, today)
   const rows = runForecast({
     initialInventory: sku.on_hand,
     baseVelocity: base,
@@ -80,6 +107,8 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
     serviceLevelZ: safety.z,
     demandStdDev: sigmaD,
     leadTimeStdDays: sku.lead_time_std_days,
+    useSeasonality: season.on,
+    seasonalityFactors,
   })
   const analytics = analyzeForecast(rows)
   const daysOfCover = base > 0 ? sku.on_hand / base : Infinity
@@ -107,6 +136,29 @@ export default function Forecast() {
     () => ({ method: safetyMethod, z: Z[serviceLvl] ?? 1.65, cv: demandCv }),
     [safetyMethod, serviceLvl, demandCv],
   )
+
+  // ── Seasonality: 12 monthly multipliers, persisted to localStorage ──────────
+  const [seasonOn,      setSeasonOn]      = useState(false)
+  const [seasonFactors, setSeasonFactors] = useState<number[]>(() => Array(12).fill(1))
+  // Load saved curve once on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SEASON_KEY)
+      if (raw) {
+        const v = JSON.parse(raw) as { on?: boolean; factors?: number[] }
+        if (Array.isArray(v.factors) && v.factors.length === 12) setSeasonFactors(v.factors.map(Number))
+        if (typeof v.on === 'boolean') setSeasonOn(v.on)
+      }
+    } catch { /* ignore corrupt storage */ }
+  }, [])
+  // Persist on change
+  useEffect(() => {
+    try { localStorage.setItem(SEASON_KEY, JSON.stringify({ on: seasonOn, factors: seasonFactors })) } catch { /* quota */ }
+  }, [seasonOn, seasonFactors])
+
+  const season: Seasonality = useMemo(() => ({ on: seasonOn, factors: seasonFactors }), [seasonOn, seasonFactors])
+  const setMonth = (i: number, v: number) =>
+    setSeasonFactors(f => f.map((x, idx) => (idx === i ? Math.max(0, v) : x)))
 
   const [edits,    setEdits]    = useState<Record<string, Partial<Sku>>>({})
   const [selected, setSelected] = useState<string | null>(null)
@@ -139,9 +191,9 @@ export default function Forecast() {
   const computed = useMemo(() => {
     return skus.map(s => {
       const eff = effective(s)
-      return { sku: eff, ...computeFor(eff, weights, horizon, policy, today, safety) }
+      return { sku: eff, ...computeFor(eff, weights, horizon, policy, today, safety, season) }
     })
-  }, [skus, edits, weights, horizon, policy, today, effective, safety])
+  }, [skus, edits, weights, horizon, policy, today, effective, safety, season])
 
   // Sort: most urgent first (fewest days of cover)
   const rows = useMemo(
@@ -304,6 +356,60 @@ export default function Forecast() {
               />
             </div>
           ))}
+        </div>
+      </div>
+
+      {/* ── Seasonality (monthly demand curve) ──────────────── */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <div className="flex items-center justify-between flex-wrap gap-2 mb-1">
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={seasonOn}
+              onChange={e => setSeasonOn(e.target.checked)}
+              className="accent-indigo-500 w-4 h-4"
+            />
+            <span className="text-xs font-semibold text-gray-300 uppercase tracking-wider">Seasonality</span>
+          </label>
+          <div className="flex items-center gap-1.5">
+            {Object.keys(SEASON_PRESETS).map(name => (
+              <button
+                key={name}
+                onClick={() => { setSeasonFactors([...SEASON_PRESETS[name]]); if (name !== 'Flat') setSeasonOn(true) }}
+                className="text-xs px-2 py-1 rounded-md border border-gray-700 text-gray-300 hover:bg-gray-800 hover:text-white"
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+        </div>
+        <p className="text-xs text-gray-500 mb-3">
+          Monthly demand multiplier — <span className="text-gray-400">1.0 = your current run-rate</span>.
+          {' '}Normalised so <span className="text-amber-400">{MONTHS[today.getMonth()]}</span> (the period your velocity is measured in) anchors to 1.0;
+          other months scale relative to it. Applied to reorder timing &amp; stockout dates.
+        </p>
+        <div className={`grid grid-cols-6 sm:grid-cols-12 gap-2 ${seasonOn ? '' : 'opacity-40 pointer-events-none'}`}>
+          {seasonFactors.map((f, i) => {
+            const maxF = Math.max(1, ...seasonFactors)
+            const isCur = i === today.getMonth()
+            return (
+              <div key={i} className="flex flex-col items-center gap-1">
+                <div className="h-10 w-full flex items-end justify-center">
+                  <div
+                    className={`w-3 rounded-t ${isCur ? 'bg-amber-400' : 'bg-indigo-500/70'}`}
+                    style={{ height: `${Math.max(2, (f / maxF) * 40)}px` }}
+                  />
+                </div>
+                <label className={`text-[10px] ${isCur ? 'text-amber-400' : 'text-gray-500'}`}>{MONTHS[i]}</label>
+                <input
+                  type="number" min={0} max={5} step={0.05}
+                  value={f}
+                  onChange={e => setMonth(i, parseFloat(e.target.value) || 0)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-1 py-1 text-xs text-white text-center"
+                />
+              </div>
+            )
+          })}
         </div>
       </div>
 
