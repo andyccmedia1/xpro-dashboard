@@ -3,8 +3,8 @@ import { NextResponse }       from 'next/server'
 
 // Default planning params when a SKU has no sku_params row yet.
 const DEFAULTS = {
-  on_hand: 0, inbound_qty: 0, inbound_days: 0,
-  lead_time_days: 80, safety_stock_days: 15,
+  on_hand: 0,
+  lead_time_days: 80, lead_time_std_days: 0, safety_stock_days: 15,
   moq: 0, casepack: 1, cycle_cover_days: 35,
 }
 
@@ -32,7 +32,7 @@ export async function GET(request: Request) {
 
   const { data: params } = await supabase
     .from('sku_params')
-    .select('msku, on_hand, inbounds, lead_time_days, safety_stock_days, moq, casepack, cycle_cover_days')
+    .select('msku, on_hand, inbounds, lead_time_days, lead_time_std_days, safety_stock_days, moq, casepack, cycle_cover_days')
     .eq('brand', brand)
 
   const paramMap = new Map<string, Record<string, unknown>>()
@@ -45,10 +45,11 @@ export async function GET(request: Request) {
       asin:  (r.asin as string | null) ?? null,
       v7: num(r.vel_7), v14: num(r.vel_14), v30: num(r.vel_30), v60: num(r.vel_60), v90: num(r.vel_90),
       units_7: num(r.units_7), units_14: num(r.units_14), units_30: num(r.units_30), units_60: num(r.units_60), units_90: num(r.units_90),
-      on_hand:           num(p.on_hand ?? DEFAULTS.on_hand),
-      inbounds:          Array.isArray(p.inbounds) ? p.inbounds : [],
-      lead_time_days:    num(p.lead_time_days ?? DEFAULTS.lead_time_days),
-      safety_stock_days: num(p.safety_stock_days ?? DEFAULTS.safety_stock_days),
+      on_hand:            num(p.on_hand ?? DEFAULTS.on_hand),
+      inbounds:           Array.isArray(p.inbounds) ? p.inbounds : [],
+      lead_time_days:     num(p.lead_time_days ?? DEFAULTS.lead_time_days),
+      lead_time_std_days: num(p.lead_time_std_days ?? DEFAULTS.lead_time_std_days),
+      safety_stock_days:  num(p.safety_stock_days ?? DEFAULTS.safety_stock_days),
       moq:               num(p.moq ?? DEFAULTS.moq),
       casepack:          num(p.casepack ?? DEFAULTS.casepack),
       cycle_cover_days:  num(p.cycle_cover_days ?? DEFAULTS.cycle_cover_days),
@@ -78,10 +79,11 @@ export async function POST(request: Request) {
   const row = {
     brand:             body.brand ?? 'xpro',
     msku:              String(body.msku),
-    on_hand:           Math.round(num(body.on_hand)),
+    on_hand:            Math.round(num(body.on_hand)),
     inbounds,
-    lead_time_days:    Math.round(num(body.lead_time_days ?? DEFAULTS.lead_time_days)),
-    safety_stock_days: Math.round(num(body.safety_stock_days ?? DEFAULTS.safety_stock_days)),
+    lead_time_days:     Math.round(num(body.lead_time_days ?? DEFAULTS.lead_time_days)),
+    lead_time_std_days: Math.round(num(body.lead_time_std_days ?? DEFAULTS.lead_time_std_days)),
+    safety_stock_days:  Math.round(num(body.safety_stock_days ?? DEFAULTS.safety_stock_days)),
     moq:               Math.round(num(body.moq)),
     casepack:          Math.max(1, Math.round(num(body.casepack ?? 1))),
     cycle_cover_days:  Math.round(num(body.cycle_cover_days ?? DEFAULTS.cycle_cover_days)),

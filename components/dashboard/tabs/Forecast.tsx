@@ -18,21 +18,26 @@ type Sku = {
   v7: number; v14: number; v30: number; v60: number; v90: number
   units_7: number; units_14: number; units_30: number; units_60: number; units_90: number
   on_hand: number; inbounds: Inbound[]
-  lead_time_days: number; safety_stock_days: number
+  lead_time_days: number; lead_time_std_days: number; safety_stock_days: number
   moq: number; casepack: number; cycle_cover_days: number
   has_params: boolean
 }
 
 type Policy = 'R_S' | 's_Q' | 'EOQ'
+type SafetyMethod = 'days' | 'service'
+
+// Service-level → z-score
+const Z: Record<string, number> = { '90': 1.28, '95': 1.65, '97': 1.88, '99': 2.33 }
 
 // Scalar editable params (inbound shipments are edited in their own list section)
 const PARAM_FIELDS = [
-  { key: 'on_hand',           label: 'On-hand units' },
-  { key: 'lead_time_days',    label: 'Lead time (days)' },
-  { key: 'safety_stock_days', label: 'Safety stock (days)' },
-  { key: 'cycle_cover_days',  label: 'Cycle coverage (days)' },
-  { key: 'moq',               label: 'MOQ' },
-  { key: 'casepack',          label: 'Casepack' },
+  { key: 'on_hand',            label: 'On-hand units' },
+  { key: 'lead_time_days',     label: 'Lead time (days)' },
+  { key: 'lead_time_std_days', label: 'Lead time ± (days)' },
+  { key: 'safety_stock_days',  label: 'Safety stock (days)' },
+  { key: 'cycle_cover_days',   label: 'Cycle coverage (days)' },
+  { key: 'moq',                label: 'MOQ' },
+  { key: 'casepack',           label: 'Casepack' },
 ] as const
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -49,11 +54,15 @@ function inboundDayOffset(inboundDate: string | null, anchor: Date): number | nu
   return offset >= 0 ? offset : null
 }
 
-function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date) {
+type Safety = { method: SafetyMethod; z: number; cv: number }
+
+function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety) {
   const base = weightedVelocity({ v7: sku.v7, v14: sku.v14, v30: sku.v30, v60: sku.v60, v90: sku.v90 }, weights)
   const deliveries = (sku.inbounds ?? [])
     .map(s => ({ day: inboundDayOffset(s.date, today), qty: s.qty }))
     .filter((d): d is { day: number; qty: number } => d.day != null && d.qty > 0)
+  const useService = safety.method === 'service'
+  const sigmaD = safety.cv * base   // daily demand std as a fraction of velocity
   const rows = runForecast({
     initialInventory: sku.on_hand,
     baseVelocity: base,
@@ -67,10 +76,18 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
     casepack: sku.casepack,
     reorderPolicy: policy,
     dynamicReorder: true,
+    useServiceLevelSafety: useService,
+    serviceLevelZ: safety.z,
+    demandStdDev: sigmaD,
+    leadTimeStdDays: sku.lead_time_std_days,
   })
   const analytics = analyzeForecast(rows)
   const daysOfCover = base > 0 ? sku.on_hand / base : Infinity
-  return { base, rows, analytics, daysOfCover }
+  // Safety stock figure for display (mirrors the engine)
+  const safetyStock = useService
+    ? safety.z * Math.sqrt(sigmaD * sigmaD * sku.lead_time_days + base * base * sku.lead_time_std_days * sku.lead_time_std_days)
+    : base * sku.safety_stock_days
+  return { base, rows, analytics, daysOfCover, safetyStock }
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -82,6 +99,14 @@ export default function Forecast() {
   const [weights, setWeights] = useState<PeriodWeights>(DEFAULT_WEIGHTS)
   const [horizon, setHorizon] = useState(180)
   const [policy,  setPolicy]  = useState<Policy>('R_S')
+  const [safetyMethod, setSafetyMethod] = useState<SafetyMethod>('days')
+  const [serviceLvl,   setServiceLvl]   = useState('95')   // %
+  const [demandCv,     setDemandCv]     = useState(0.4)    // σ_d as fraction of velocity
+
+  const safety: Safety = useMemo(
+    () => ({ method: safetyMethod, z: Z[serviceLvl] ?? 1.65, cv: demandCv }),
+    [safetyMethod, serviceLvl, demandCv],
+  )
 
   const [edits,    setEdits]    = useState<Record<string, Partial<Sku>>>({})
   const [selected, setSelected] = useState<string | null>(null)
@@ -112,9 +137,9 @@ export default function Forecast() {
   const computed = useMemo(() => {
     return skus.map(s => {
       const eff = effective(s)
-      return { sku: eff, ...computeFor(eff, weights, horizon, policy, today) }
+      return { sku: eff, ...computeFor(eff, weights, horizon, policy, today, safety) }
     })
-  }, [skus, edits, weights, horizon, policy, today, effective])
+  }, [skus, edits, weights, horizon, policy, today, effective, safety])
 
   // Sort: most urgent first (fewest days of cover)
   const rows = useMemo(
@@ -143,7 +168,8 @@ export default function Forecast() {
         body: JSON.stringify({
           msku: s.msku,
           on_hand: s.on_hand, inbounds: s.inbounds,
-          lead_time_days: s.lead_time_days, safety_stock_days: s.safety_stock_days,
+          lead_time_days: s.lead_time_days, lead_time_std_days: s.lead_time_std_days,
+          safety_stock_days: s.safety_stock_days,
           moq: s.moq, casepack: s.casepack, cycle_cover_days: s.cycle_cover_days,
         }),
       })
@@ -188,6 +214,35 @@ export default function Forecast() {
           >
             {[90, 180, 270, 365].map(d => <option key={d} value={d}>{d}d</option>)}
           </select>
+          <span className="text-gray-500 ml-2">Safety stock</span>
+          <select
+            value={safetyMethod}
+            onChange={e => setSafetyMethod(e.target.value as SafetyMethod)}
+            className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-gray-200"
+          >
+            <option value="days">Days-based</option>
+            <option value="service">Service level (lead-time risk)</option>
+          </select>
+          {safetyMethod === 'service' && (
+            <>
+              <select
+                value={serviceLvl}
+                onChange={e => setServiceLvl(e.target.value)}
+                className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-gray-200"
+                title="Service level (chance of not stocking out during lead time)"
+              >
+                {['90', '95', '97', '99'].map(s => <option key={s} value={s}>{s}%</option>)}
+              </select>
+              <span className="text-gray-500" title="Daily demand variability as a fraction of velocity">CV</span>
+              <input
+                type="number" min={0} max={2} step={0.05}
+                value={demandCv}
+                onChange={e => setDemandCv(Math.max(0, parseFloat(e.target.value) || 0))}
+                className="w-14 bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-gray-200 text-center"
+                title="Demand coefficient of variation (σ_d ÷ velocity)"
+              />
+            </>
+          )}
         </div>
       </div>
 
@@ -357,6 +412,18 @@ export default function Forecast() {
                 </button>
                 {edits[sel.sku.msku] && <span className="text-xs text-amber-400">unsaved changes — forecast updates live</span>}
               </div>
+
+              {/* Safety stock readout */}
+              <p className="text-xs text-gray-500">
+                {safetyMethod === 'service' ? (
+                  <>Safety stock <span className="text-gray-300">{n0(sel.safetyStock)} units</span> @ {serviceLvl}% service —
+                    includes <span className="text-amber-400">±{sel.sku.lead_time_std_days}d lead-time risk</span> ·
+                    reorder point <span className="text-gray-300">{n0(sel.rows[0]?.reorderPoint ?? 0)}</span></>
+                ) : (
+                  <>Safety stock <span className="text-gray-300">{n0(sel.safetyStock)} units</span> ({sel.sku.safety_stock_days} days,
+                    no lead-time risk) · reorder point <span className="text-gray-300">{n0(sel.rows[0]?.reorderPoint ?? 0)}</span></>
+                )}
+              </p>
 
               {/* Analytics cards */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">

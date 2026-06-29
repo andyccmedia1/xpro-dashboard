@@ -41,7 +41,8 @@ export type ForecastParams = {
   moq?: number                  // default 0
   casepack?: number             // default 1
   serviceLevelZ?: number        // default 1.65 (~95%)
-  demandStdDev?: number | null  // default null -> 20% of baseVelocity
+  demandStdDev?: number | null  // σ_d, daily demand std; default null -> 20% of baseVelocity
+  leadTimeStdDays?: number      // σ_L, lead-time std in days (default 0 = deterministic)
   useServiceLevelSafety?: boolean
   stockoutMode?: 'lost_sales' | 'backorders'    // default 'lost_sales'
 }
@@ -113,8 +114,11 @@ export function runForecast(p: ForecastParams): ForecastRow[] {
     }
     return total
   }
+  const sigmaL = p.leadTimeStdDays ?? 0
   const safetyStockDaysBased = (v: number) => v * safetyDays
-  const safetyStockServiceLevel = (L: number) => zScore * Math.sqrt(stdDev * stdDev * L)
+  // SS = z · √(L·σ_d²  +  d²·σ_L²) — demand variability + lead-time variability
+  const safetyStockServiceLevel = (L: number) =>
+    zScore * Math.sqrt(stdDev * stdDev * L + p.baseVelocity * p.baseVelocity * sigmaL * sigmaL)
   const roundToCasepack = (qty: number): number => {
     if (qty <= 0) return 0
     return Math.max(Math.ceil(qty / casepack) * casepack, moq)

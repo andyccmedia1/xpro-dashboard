@@ -348,8 +348,9 @@ create table if not exists sku_params (
   inbound_days      integer      not null default 0,    -- (legacy) days until inbound arrives
   inbound_date      date,                                -- (legacy) single inbound arrival date
   inbounds          jsonb        not null default '[]'::jsonb,  -- [{date,qty}, …] multiple shipments
-  lead_time_days    integer      not null default 80,   -- reorder lead time
-  safety_stock_days integer      not null default 15,   -- days of safety stock
+  lead_time_days    integer      not null default 80,   -- reorder lead time (mean)
+  lead_time_std_days integer     not null default 0,    -- lead-time variability (± days, σ_L)
+  safety_stock_days integer      not null default 15,   -- days of safety stock (days-based method)
   moq               integer      not null default 0,    -- minimum order quantity
   casepack          integer      not null default 1,    -- order rounding multiple
   cycle_cover_days  integer      not null default 35,   -- order-up-to cycle coverage
