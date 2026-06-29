@@ -373,7 +373,10 @@ export default function Forecast() {
               {/* Projection chart */}
               <div className="h-72">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={sel.rows} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
+                  <LineChart
+                    data={sel.rows.map(r => ({ ...r, reorderMarker: r.reorderTrigger ? r.inventory : null }))}
+                    margin={{ top: 16, right: 12, bottom: 0, left: 0 }}
+                  >
                     <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
                     <XAxis dataKey="date" tick={{ fill: '#6b7280', fontSize: 10 }}
                            tickFormatter={(d: string) => d.slice(5)} minTickGap={40} />
@@ -381,22 +384,42 @@ export default function Forecast() {
                     <Tooltip
                       contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8, fontSize: 12 }}
                       labelStyle={{ color: '#9ca3af' }}
+                      formatter={(v, name, item) => {
+                        if (name === 'Reorder placed') {
+                          const qty = (item?.payload as ForecastRow | undefined)?.reorderAmount ?? 0
+                          return [`${n0(qty)} units ordered`, name]
+                        }
+                        return [n0(Number(v)), name]
+                      }}
                     />
                     <Line type="monotone" dataKey="inventory" name="On-hand" stroke="#6366f1" dot={false} strokeWidth={2} />
                     <Line type="monotone" dataKey="reorderPoint" name="Reorder point" stroke="#f59e0b" dot={false} strokeDasharray="4 3" strokeWidth={1.5} />
+                    {/* Star at each reorder-trigger point */}
+                    <Line type="monotone" dataKey="reorderMarker" name="Reorder placed" stroke="none"
+                          isAnimationActive={false} dot={<ReorderStar />} activeDot={false} legendType="none" />
                     <ReferenceLine y={0} stroke="#ef4444" strokeDasharray="2 2" />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
               <p className="text-xs text-gray-600">
-                Indigo = projected on-hand · amber dashed = reorder point (lead-time demand + safety stock).
-                When the indigo line crosses below amber, a reorder fires; the jump back up is that order arriving after lead time.
+                Indigo = projected on-hand · amber dashed = reorder point (lead-time demand + safety stock) ·
+                <span className="text-amber-400"> ★ = reorder placed</span> (hover for the order qty).
+                Each jump up is a shipment arriving — your inbound POs, plus auto-reorders landing after the lead time.
               </p>
             </div>
           )}
         </>
       )}
     </div>
+  )
+}
+
+// Amber star drawn at each reorder-trigger point (recharts custom dot)
+function ReorderStar(props: { cx?: number; cy?: number; payload?: { reorderMarker?: number | null } }) {
+  const { cx, cy, payload } = props
+  if (cx == null || cy == null || payload?.reorderMarker == null) return null
+  return (
+    <text x={cx} y={cy} dy={5} textAnchor="middle" fontSize={16} fill="#f59e0b" stroke="#111827" strokeWidth={0.5}>★</text>
   )
 }
 
