@@ -32,7 +32,7 @@ export async function GET(request: Request) {
 
   const { data: params } = await supabase
     .from('sku_params')
-    .select('msku, on_hand, inbounds, lead_time_days, lead_time_std_days, safety_stock_days, moq, casepack, cycle_cover_days')
+    .select('msku, on_hand, inbounds, lead_time_days, lead_time_std_days, safety_stock_days, moq, casepack, cycle_cover_days, seasonality')
     .eq('brand', brand)
 
   const paramMap = new Map<string, Record<string, unknown>>()
@@ -53,6 +53,7 @@ export async function GET(request: Request) {
       moq:               num(p.moq ?? DEFAULTS.moq),
       casepack:          num(p.casepack ?? DEFAULTS.casepack),
       cycle_cover_days:  num(p.cycle_cover_days ?? DEFAULTS.cycle_cover_days),
+      seasonality:       Array.isArray(p.seasonality) && p.seasonality.length === 12 ? p.seasonality.map(num) : [],
       has_params:        paramMap.has(r.msku as string),
     }
   }).sort((a, b) => b.v30 - a.v30)
@@ -76,11 +77,17 @@ export async function POST(request: Request) {
         .filter((s: { date: string; qty: number }) => s.date && s.qty > 0)
     : []
 
+  // Per-SKU seasonality override: exactly 12 non-negative multipliers, else [] (use global).
+  const seasonality = Array.isArray(body.seasonality) && body.seasonality.length === 12
+    ? body.seasonality.map((v: unknown) => Math.max(0, num(v)))
+    : []
+
   const row = {
     brand:             body.brand ?? 'xpro',
     msku:              String(body.msku),
     on_hand:            Math.round(num(body.on_hand)),
     inbounds,
+    seasonality,
     lead_time_days:     Math.round(num(body.lead_time_days ?? DEFAULTS.lead_time_days)),
     lead_time_std_days: Math.round(num(body.lead_time_std_days ?? DEFAULTS.lead_time_std_days)),
     safety_stock_days:  Math.round(num(body.safety_stock_days ?? DEFAULTS.safety_stock_days)),

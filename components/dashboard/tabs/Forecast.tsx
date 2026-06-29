@@ -20,6 +20,7 @@ type Sku = {
   on_hand: number; inbounds: Inbound[]
   lead_time_days: number; lead_time_std_days: number; safety_stock_days: number
   moq: number; casepack: number; cycle_cover_days: number
+  seasonality: number[]   // per-SKU override: 12 monthly multipliers, or [] = use global
   has_params: boolean
 }
 
@@ -89,7 +90,9 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
     .filter((d): d is { day: number; qty: number } => d.day != null && d.qty > 0)
   const useService = safety.method === 'service'
   const sigmaD = safety.cv * base   // daily demand std as a fraction of velocity
-  const seasonalityFactors = seasonalityMap(season, today)
+  // Per-SKU curve overrides the global one; global toggle still gates whether any applies.
+  const effFactors = sku.seasonality?.length === 12 ? sku.seasonality : season.factors
+  const seasonalityFactors = seasonalityMap({ on: season.on, factors: effFactors }, today)
   const rows = runForecast({
     initialInventory: sku.on_hand,
     baseVelocity: base,
@@ -202,8 +205,9 @@ export default function Forecast() {
   )
 
   const sel = computed.find(c => c.sku.msku === selected) ?? null
+  const selCustomSeason = (sel?.sku.seasonality?.length ?? 0) === 12
 
-  function setEdit(msku: string, key: keyof Sku, value: number | string | null | Inbound[]) {
+  function setEdit(msku: string, key: keyof Sku, value: number | string | null | Inbound[] | number[]) {
     setEdits(e => ({ ...e, [msku]: { ...e[msku], [key]: value } }))
     setSaveState('idle')
   }
@@ -213,6 +217,13 @@ export default function Forecast() {
   const removeInbound = (s: Sku, i: number) => setInbounds(s, (s.inbounds ?? []).filter((_, idx) => idx !== i))
   const updateInbound = (s: Sku, i: number, field: keyof Inbound, value: string | number) =>
     setInbounds(s, (s.inbounds ?? []).map((sh, idx) => (idx === i ? { ...sh, [field]: value } : sh)))
+
+  // Per-SKU seasonality override editors (empty [] = inherit the global curve)
+  const enableSkuSeason = (s: Sku) => setEdit(s.msku, 'seasonality', [...seasonFactors])   // seed from global
+  const clearSkuSeason  = (s: Sku) => setEdit(s.msku, 'seasonality', [])
+  const updateSkuSeason = (s: Sku, i: number, v: number) =>
+    setEdit(s.msku, 'seasonality',
+      (s.seasonality?.length === 12 ? s.seasonality : seasonFactors).map((x, idx) => (idx === i ? Math.max(0, v) : x)))
 
   // Refs so saveSku always reads the latest state without being re-created
   // (a stable identity keeps the auto-save effect from looping).
@@ -242,6 +253,7 @@ export default function Forecast() {
           lead_time_days: merged.lead_time_days, lead_time_std_days: merged.lead_time_std_days,
           safety_stock_days: merged.safety_stock_days,
           moq: merged.moq, casepack: merged.casepack, cycle_cover_days: merged.cycle_cover_days,
+          seasonality: merged.seasonality,
         }),
       })
       if (!res.ok) {
@@ -449,7 +461,12 @@ export default function Forecast() {
                         className={`border-b border-gray-800/60 cursor-pointer ${isSel ? 'bg-gray-800/50' : 'hover:bg-gray-800/30'}`}
                       >
                         <td className="px-4 py-3">
-                          <div className="text-white">{sku.msku}</div>
+                          <div className="text-white flex items-center gap-1.5">
+                            {sku.msku}
+                            {sku.seasonality?.length === 12 && (
+                              <span className="text-emerald-400 text-xs" title="Custom seasonality curve">✦</span>
+                            )}
+                          </div>
                           {sku.asin && <div className="text-xs text-gray-600">{sku.asin}</div>}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums text-gray-200">{n2(base)}</td>
@@ -543,6 +560,58 @@ export default function Forecast() {
                       </div>
                     ))}
                   </div>
+                )}
+              </div>
+
+              {/* Per-SKU seasonality override */}
+              <div className="border-t border-gray-800 pt-4">
+                <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Seasonality · this SKU</label>
+                  {selCustomSeason ? (
+                    <button onClick={() => clearSkuSeason(sel.sku)} className="text-xs text-gray-400 hover:text-rose-400">
+                      Clear → use global curve
+                    </button>
+                  ) : (
+                    <button onClick={() => enableSkuSeason(sel.sku)} className="text-xs font-medium text-emerald-400 hover:text-emerald-300">
+                      + Custom curve for this SKU
+                    </button>
+                  )}
+                </div>
+                {!selCustomSeason ? (
+                  <p className="text-xs text-gray-600">
+                    Using the global curve{seasonOn ? '' : ' (master toggle currently off)'}. Add a custom curve to override demand seasonality for just this SKU.
+                  </p>
+                ) : (
+                  <>
+                    {!seasonOn && (
+                      <p className="text-xs text-amber-400 mb-2">
+                        Master Seasonality toggle is off — turn it on above for this curve to affect the forecast.
+                      </p>
+                    )}
+                    <div className="grid grid-cols-6 sm:grid-cols-12 gap-2">
+                      {sel.sku.seasonality.map((f, i) => {
+                        const maxF = Math.max(1, ...sel.sku.seasonality)
+                        const isCur = i === today.getMonth()
+                        return (
+                          <div key={i} className="flex flex-col items-center gap-1">
+                            <div className="h-8 w-full flex items-end justify-center">
+                              <div
+                                className={`w-3 rounded-t ${isCur ? 'bg-amber-400' : 'bg-emerald-500/70'}`}
+                                style={{ height: `${Math.max(2, (f / maxF) * 32)}px` }}
+                              />
+                            </div>
+                            <label className={`text-[10px] ${isCur ? 'text-amber-400' : 'text-gray-500'}`}>{MONTHS[i]}</label>
+                            <input
+                              type="number" min={0} max={5} step={0.05}
+                              value={f}
+                              onChange={e => updateSkuSeason(sel.sku, i, parseFloat(e.target.value) || 0)}
+                              className="w-full bg-gray-800 border border-gray-700 rounded px-1 py-1 text-xs text-white text-center"
+                            />
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </>
                 )}
               </div>
 

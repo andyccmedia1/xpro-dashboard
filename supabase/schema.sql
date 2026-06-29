@@ -354,6 +354,7 @@ create table if not exists sku_params (
   moq               integer      not null default 0,    -- minimum order quantity
   casepack          integer      not null default 1,    -- order rounding multiple
   cycle_cover_days  integer      not null default 35,   -- order-up-to cycle coverage
+  seasonality       jsonb        not null default '[]'::jsonb,  -- per-SKU 12-month multipliers, [] = use global
   updated_at        timestamptz  not null default now(),
 
   primary key (msku, brand)
