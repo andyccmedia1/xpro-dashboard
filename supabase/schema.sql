@@ -223,6 +223,35 @@ create policy "authenticated users can update amazon_sku_windows"
 grant select, insert, update, delete on amazon_sku_windows to service_role;
 
 
+-- ── 5c. sku_map (ASIN→canonical MSKU overrides) ──────────────
+-- User-maintained corrections for products whose Amazon listing SKU (from the
+-- listings report) is a stale/ghost SKU that differs from the canonical MSKU.
+-- The daily pull overlays these on the listings map (overrides win), so the
+-- Amazon-marketplace windows (amazon_sku_windows) get filed under the right MSKU
+-- and merge with the MCF side in sku_velocity.
+
+create table if not exists sku_map (
+  asin       varchar(20)  not null,
+  brand      varchar(50)  not null default 'xpro',
+  msku       text         not null,   -- canonical MSKU this ASIN should map to
+  note       text,
+  updated_at timestamptz  not null default now(),
+
+  primary key (asin, brand)
+);
+
+create or replace trigger sku_map_updated_at
+  before update on sku_map
+  for each row execute function set_updated_at();
+
+alter table sku_map enable row level security;
+
+create policy "authenticated users can read sku_map"
+  on sku_map for select to authenticated using (true);
+
+grant select, insert, update, delete on sku_map to service_role;
+
+
 -- ── 6. sku_velocity (view) ───────────────────────────────────
 -- TOTAL demand per MSKU over 7/14/30/60/90-day windows ending YESTERDAY =
 --   Amazon-marketplace units ordered (amazon_sku_windows, pre-computed windows)
