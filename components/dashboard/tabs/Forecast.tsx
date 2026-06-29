@@ -110,11 +110,13 @@ export default function Forecast() {
 
   const [edits,    setEdits]    = useState<Record<string, Partial<Sku>>>({})
   const [selected, setSelected] = useState<string | null>(null)
-  const [saving,   setSaving]   = useState(false)
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [saveErr,   setSaveErr]   = useState('')
   const detailRef = useRef<HTMLDivElement>(null)
 
   // Scroll the detail panel into view when a SKU is selected (it renders below the table)
   useEffect(() => {
+    setSaveState('idle')
     if (selected) detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [selected])
 
@@ -151,6 +153,7 @@ export default function Forecast() {
 
   function setEdit(msku: string, key: keyof Sku, value: number | string | null | Inbound[]) {
     setEdits(e => ({ ...e, [msku]: { ...e[msku], [key]: value } }))
+    setSaveState('idle')
   }
   // Inbound shipment list editors
   const setInbounds = (s: Sku, list: Inbound[]) => setEdit(s.msku, 'inbounds', list)
@@ -159,27 +162,62 @@ export default function Forecast() {
   const updateInbound = (s: Sku, i: number, field: keyof Inbound, value: string | number) =>
     setInbounds(s, (s.inbounds ?? []).map((sh, idx) => (idx === i ? { ...sh, [field]: value } : sh)))
 
-  async function saveParams(s: Sku) {
-    setSaving(true)
+  // Refs so saveSku always reads the latest state without being re-created
+  // (a stable identity keeps the auto-save effect from looping).
+  const editsRef = useRef(edits); editsRef.current = edits
+  const skusRef  = useRef(skus);  skusRef.current  = skus
+
+  // Persist one SKU's params to the DB. The merged values are folded into the
+  // base SKU on a confirmed 200, and the pending edits are cleared ONLY if the
+  // user hasn't typed since the snapshot — so nothing is ever lost. On failure
+  // the edits are left in place and the error is surfaced (the old bug silently
+  // cleared inputs and reloaded blank rows even when the save had 500'd, e.g. a
+  // missing column).
+  const saveSku = useCallback(async (msku: string) => {
+    const base = skusRef.current.find(s => s.msku === msku)
+    if (!base) return
+    const snapshot = editsRef.current[msku] ?? {}
+    const merged = { ...base, ...snapshot } as Sku
+    setSaveState('saving')
+    setSaveErr('')
     try {
-      await fetch('/api/forecast', {
+      const res = await fetch('/api/forecast', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          msku: s.msku,
-          on_hand: s.on_hand, inbounds: s.inbounds,
-          lead_time_days: s.lead_time_days, lead_time_std_days: s.lead_time_std_days,
-          safety_stock_days: s.safety_stock_days,
-          moq: s.moq, casepack: s.casepack, cycle_cover_days: s.cycle_cover_days,
+          msku: merged.msku,
+          on_hand: merged.on_hand, inbounds: merged.inbounds,
+          lead_time_days: merged.lead_time_days, lead_time_std_days: merged.lead_time_std_days,
+          safety_stock_days: merged.safety_stock_days,
+          moq: merged.moq, casepack: merged.casepack, cycle_cover_days: merged.cycle_cover_days,
         }),
       })
-      // clear edits for this sku and refresh from server
-      setEdits(e => { const c = { ...e }; delete c[s.msku]; return c })
-      load()
-    } finally {
-      setSaving(false)
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}))
+        throw new Error(j.error || `Save failed (HTTP ${res.status})`)
+      }
+      // Fold saved values into the base row (display unchanged; reload-safe).
+      setSkus(prev => prev.map(x => x.msku === msku ? { ...x, ...snapshot, has_params: true } : x))
+      // Clear pending edits only if untouched during the save (else a follow-up
+      // auto-save catches the newer keystrokes).
+      setEdits(e => { if (e[msku] === snapshot) { const c = { ...e }; delete c[msku]; return c } return e })
+      setSaveState('saved')
+    } catch (e) {
+      setSaveState('error')
+      setSaveErr(e instanceof Error ? e.message : 'Save failed')
     }
-  }
+  }, [])
+
+  // Auto-save: 800 ms after the last edit to the selected SKU, persist it.
+  // Edits live in component state keyed by msku, so switching SKUs never loses
+  // them in-session; this makes the persistence durable across reloads too.
+  useEffect(() => {
+    if (!selected) return
+    const pending = edits[selected]
+    if (!pending || Object.keys(pending).length === 0) return
+    const t = setTimeout(() => { saveSku(selected) }, 800)
+    return () => clearTimeout(t)
+  }, [edits, selected, saveSku])
 
   const weightSum = weights.w7 + weights.w14 + weights.w30 + weights.w60 + weights.w90
 
@@ -404,13 +442,17 @@ export default function Forecast() {
 
               <div className="flex items-center gap-3">
                 <button
-                  onClick={() => saveParams(sel.sku)}
-                  disabled={saving}
+                  onClick={() => saveSku(sel.sku.msku)}
+                  disabled={saveState === 'saving'}
                   className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded-lg text-sm font-medium text-white"
                 >
-                  {saving ? 'Saving…' : 'Save params'}
+                  {saveState === 'saving' ? 'Saving…' : 'Save now'}
                 </button>
-                {edits[sel.sku.msku] && <span className="text-xs text-amber-400">unsaved changes — forecast updates live</span>}
+                {saveState === 'saving' && <span className="text-xs text-gray-400">Auto-saving…</span>}
+                {saveState === 'saved'  && <span className="text-xs text-emerald-400">✓ Saved — will reload next time</span>}
+                {saveState === 'error'  && <span className="text-xs text-rose-400">⚠ Save failed: {saveErr}</span>}
+                {saveState === 'idle' && edits[sel.sku.msku] &&
+                  <span className="text-xs text-amber-400">editing… auto-saves shortly</span>}
               </div>
 
               {/* Safety stock readout */}
