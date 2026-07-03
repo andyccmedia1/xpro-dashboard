@@ -95,6 +95,7 @@ _ADS_BASE_URL  = "https://advertising-api.amazon.com"
 _SP_CHUNK_DAYS = 30   # SP-API: request at most 30 days per report
 _ADS_CHUNK_DAYS = 30  # Ads API: maximum 30 days per report
 _SB_SD_RETENTION_DAYS = 59  # SB/SD data retention window
+_PPC_REFRESH_DAYS = 5  # trailing window re-pulled & overwritten each run (Ads finalises 2-3d late)
 
 # ── FBA Inventory Ledger (depletion forecasting) ───────────────────────────────
 # Event-type values in GET_LEDGER_DETAIL_VIEW_DATA that represent true customer
@@ -1078,6 +1079,44 @@ def auto_backfill_ppc_gaps(brand: str, lookback_days: int = 30) -> None:
                 log.info(f"  Ads API returned no spend data for {gs}→{ge} — skipping")
         except Exception as exc:
             log.error(f"  Ads API re-pull failed for {gs}→{ge}: {exc}")
+
+
+def refresh_recent_ppc(brand: str, days: int = 5) -> None:
+    """
+    Trailing-window OVERWRITE of PPC spend for the last N days (ending yesterday).
+
+    Amazon Ads finalises Sponsored Products/Brands/Display spend with a 2-3 day
+    lag, so the daily "yesterday" pull frequently records a NULL or a partial
+    value that grows later. The NULL-only gap scan (auto_backfill_ppc_gaps) fixes
+    the null case but NEVER touches a day that already has a (possibly partial)
+    value — e.g. a day that pulled a broken $1.40 stays $1.40 forever.
+
+    This re-pulls the whole trailing window every run and overwrites the spend
+    whenever the API returns a real (>0) value, so late-finalising and partial
+    days self-correct within N days. It never clobbers an existing value with
+    NULL or 0 (only upserts days the API actually returned a positive spend for).
+    """
+    today = date.today()
+    end   = today - timedelta(days=1)
+    start = today - timedelta(days=days)
+
+    log.info(f"PPC trailing refresh: re-pulling [{start} → {end}] (overwrite finalised/partial spend)…")
+    try:
+        all_spend = ads_pull_range(start, end)
+    except Exception as exc:
+        log.warning(f"PPC trailing refresh failed: {exc} — skipping")
+        return
+
+    rows = [
+        {"date": ds, "brand": brand, "amazon_ppc_spend": all_spend[ds]}
+        for ds in (d.strftime("%Y-%m-%d") for d in date_range(start, end))
+        if all_spend.get(ds, 0) > 0
+    ]
+    if rows:
+        supabase_upsert("daily_data", rows)
+        log.info(f"  ✓ Refreshed PPC for {len(rows)} recent day(s)")
+    else:
+        log.info("  Trailing refresh: no positive PPC returned for the window — leaving existing values")
 
 
 def find_asin_session_gaps(start: date, end: date, brand: str) -> list[date]:
@@ -2187,7 +2226,8 @@ def main() -> None:
     else:
         # Default cron mode: scan for gaps first, then pull yesterday
         auto_backfill_gaps(args.brand, lookback_days=30)         # missing days entirely
-        auto_backfill_ppc_gaps(args.brand, lookback_days=30)     # days with revenue but no PPC
+        auto_backfill_ppc_gaps(args.brand, lookback_days=30)     # days with revenue but no PPC (nulls)
+        refresh_recent_ppc(args.brand, days=_PPC_REFRESH_DAYS)   # overwrite last N days (Ads finalises late)
         auto_refresh_asin_sessions(args.brand, lookback_days=30) # days with sessions=0 (delayed traffic)
         pull_day(date.today() - timedelta(days=1), args.brand)
 
