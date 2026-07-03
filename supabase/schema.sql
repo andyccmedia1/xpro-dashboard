@@ -252,6 +252,38 @@ create policy "authenticated users can read sku_map"
 grant select, insert, update, delete on sku_map to service_role;
 
 
+-- ── 5d. forecast_settings (global blend + controls) ──────────
+-- One row per brand: the velocity-blend weights, reorder policy, horizon,
+-- safety-stock method/level/CV, and the global seasonality curve. Persisted
+-- server-side (was browser localStorage) so it survives cache clears and is
+-- shared across devices. Per-SKU params live in sku_params; this is the
+-- brand-wide defaults the Forecast tab's "Save settings" button writes.
+
+create table if not exists forecast_settings (
+  brand          varchar(50)  primary key default 'xpro',
+  weights        jsonb        not null default '{}'::jsonb,   -- {w7,w14,w30,w60,w90}
+  horizon        integer      not null default 180,
+  policy         text         not null default 'R_S',
+  safety_method  text         not null default 'days',
+  service_lvl    text         not null default '95',
+  demand_cv      numeric      not null default 0.4,
+  seasonality_on boolean      not null default false,
+  seasonality    jsonb        not null default '[]'::jsonb,   -- global 12-month curve, [] = flat
+  updated_at     timestamptz  not null default now()
+);
+
+create or replace trigger forecast_settings_updated_at
+  before update on forecast_settings
+  for each row execute function set_updated_at();
+
+alter table forecast_settings enable row level security;
+
+create policy "authenticated users can read forecast_settings"
+  on forecast_settings for select to authenticated using (true);
+
+grant select, insert, update, delete on forecast_settings to service_role;
+
+
 -- ── 6. sku_velocity (view) ───────────────────────────────────
 -- TOTAL demand per MSKU over 7/14/30/60/90-day windows ending YESTERDAY =
 --   Amazon-marketplace units ordered (amazon_sku_windows, pre-computed windows)

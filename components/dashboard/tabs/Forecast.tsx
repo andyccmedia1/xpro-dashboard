@@ -33,8 +33,6 @@ const Z: Record<string, number> = { '90': 1.28, '95': 1.65, '97': 1.88, '99': 2.
 
 // Seasonality: month labels, localStorage key, and a few starter curves (Jan..Dec)
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
-const SEASON_KEY = 'xpro_forecast_seasonality'
-const SETTINGS_KEY = 'xpro_forecast_settings'   // global blend + policy/horizon/safety controls
 const SEASON_PRESETS: Record<string, number[]> = {
   Flat:          [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
   // E-commerce Q4 lift: soft Q1, build into Black Friday / December
@@ -143,60 +141,66 @@ export default function Forecast() {
     [safetyMethod, serviceLvl, demandCv],
   )
 
-  // ── Global forecast settings: persisted to localStorage via Save button ─────
-  const [settingsSaved, setSettingsSaved] = useState(false)
-  const settingsHydrated = useRef(false)
-  // Load saved settings once on mount
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(SETTINGS_KEY)
-      if (raw) {
-        const v = JSON.parse(raw)
-        if (v.weights)      setWeights(w => ({ ...w, ...v.weights }))
-        if (v.horizon)      setHorizon(Number(v.horizon))
-        if (v.policy)       setPolicy(v.policy)
-        if (v.safetyMethod) setSafetyMethod(v.safetyMethod)
-        if (v.serviceLvl)   setServiceLvl(String(v.serviceLvl))
-        if (typeof v.demandCv === 'number') setDemandCv(v.demandCv)
-        setSettingsSaved(true)
-      }
-    } catch { /* ignore corrupt storage */ }
-    settingsHydrated.current = true
-  }, [])
-  // Any change after hydration marks settings dirty (button reverts to "Save")
-  useEffect(() => {
-    if (settingsHydrated.current) setSettingsSaved(false)
-  }, [weights, horizon, policy, safetyMethod, serviceLvl, demandCv])
-
-  function saveSettings() {
-    try {
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify({ weights, horizon, policy, safetyMethod, serviceLvl, demandCv }))
-      setSettingsSaved(true)
-    } catch { /* quota */ }
-  }
-
-  // ── Seasonality: 12 monthly multipliers, persisted to localStorage ──────────
+  // ── Global seasonality: 12 monthly multipliers (persisted server-side) ──────
   const [seasonOn,      setSeasonOn]      = useState(false)
   const [seasonFactors, setSeasonFactors] = useState<number[]>(() => Array(12).fill(1))
-  // Load saved curve once on mount
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(SEASON_KEY)
-      if (raw) {
-        const v = JSON.parse(raw) as { on?: boolean; factors?: number[] }
-        if (Array.isArray(v.factors) && v.factors.length === 12) setSeasonFactors(v.factors.map(Number))
-        if (typeof v.on === 'boolean') setSeasonOn(v.on)
-      }
-    } catch { /* ignore corrupt storage */ }
-  }, [])
-  // Persist on change
-  useEffect(() => {
-    try { localStorage.setItem(SEASON_KEY, JSON.stringify({ on: seasonOn, factors: seasonFactors })) } catch { /* quota */ }
-  }, [seasonOn, seasonFactors])
-
   const season: Seasonality = useMemo(() => ({ on: seasonOn, factors: seasonFactors }), [seasonOn, seasonFactors])
   const setMonth = (i: number, v: number) =>
     setSeasonFactors(f => f.map((x, idx) => (idx === i ? Math.max(0, v) : x)))
+
+  // ── Global forecast settings (blend + policy/horizon/safety + global
+  //    seasonality) persisted to the forecast_settings table via the Save
+  //    button. Durable across cache clears and shared across devices. "Dirty"
+  //    is a snapshot compare, so "✓ Saved" is accurate without wiring every
+  //    change handler.
+  const currentSnapshot = JSON.stringify({
+    weights, horizon, policy, safetyMethod, serviceLvl, demandCv, seasonOn, seasonFactors,
+  })
+  const [savedSnapshot,  setSavedSnapshot]  = useState<string | null>(null)
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const settingsSaved = savedSnapshot !== null && savedSnapshot === currentSnapshot
+
+  // Load persisted settings once on mount
+  useEffect(() => {
+    fetch('/api/forecast/settings')
+      .then(r => r.json())
+      .then(({ settings: v }) => {
+        if (!v) return
+        const nWeights  = { ...DEFAULT_WEIGHTS, ...(v.weights ?? {}) }
+        const nHorizon  = v.horizon ? Number(v.horizon) : 180
+        const nPolicy   = (v.policy ?? 'R_S') as Policy
+        const nMethod   = (v.safety_method ?? 'days') as SafetyMethod
+        const nSvc      = v.service_lvl ? String(v.service_lvl) : '95'
+        const nCv       = typeof v.demand_cv === 'number' ? v.demand_cv : 0.4
+        const nSeasonOn = !!v.seasonality_on
+        const nFactors  = Array.isArray(v.seasonality) && v.seasonality.length === 12
+          ? v.seasonality.map(Number) : Array(12).fill(1)
+        setWeights(nWeights); setHorizon(nHorizon); setPolicy(nPolicy)
+        setSafetyMethod(nMethod); setServiceLvl(nSvc); setDemandCv(nCv)
+        setSeasonOn(nSeasonOn); setSeasonFactors(nFactors)
+        setSavedSnapshot(JSON.stringify({
+          weights: nWeights, horizon: nHorizon, policy: nPolicy, safetyMethod: nMethod,
+          serviceLvl: nSvc, demandCv: nCv, seasonOn: nSeasonOn, seasonFactors: nFactors,
+        }))
+      })
+      .catch(() => { /* defaults stand */ })
+  }, [])
+
+  async function saveSettings() {
+    const snap = currentSnapshot
+    setSettingsSaving(true)
+    try {
+      const res = await fetch('/api/forecast/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          weights, horizon, policy, safety_method: safetyMethod, service_lvl: serviceLvl,
+          demand_cv: demandCv, seasonality_on: seasonOn, seasonality: seasonFactors,
+        }),
+      })
+      if (res.ok) setSavedSnapshot(snap)
+    } catch { /* leave marked unsaved */ }
+    finally { setSettingsSaving(false) }
+  }
 
   const [edits,    setEdits]    = useState<Record<string, Partial<Sku>>>({})
   const [selected, setSelected] = useState<string | null>(null)
@@ -416,11 +420,11 @@ export default function Forecast() {
             </span>
             <button
               onClick={saveSettings}
-              disabled={settingsSaved}
-              title="Save the blend weights plus reorder policy, horizon and safety-stock settings — restored on next visit"
-              className="text-xs font-medium px-2.5 py-1 rounded-md border border-gray-700 text-indigo-400 hover:bg-gray-800 hover:text-indigo-300 disabled:text-emerald-400 disabled:border-transparent disabled:hover:bg-transparent"
+              disabled={settingsSaved || settingsSaving}
+              title="Save the blend weights, reorder policy, horizon, safety-stock settings and global seasonality to the database — restored on every device"
+              className="text-xs font-medium px-2.5 py-1 rounded-md border border-gray-700 text-indigo-400 hover:bg-gray-800 hover:text-indigo-300 disabled:border-transparent disabled:hover:bg-transparent disabled:text-emerald-400"
             >
-              {settingsSaved ? '✓ Saved' : 'Save settings'}
+              {settingsSaving ? 'Saving…' : settingsSaved ? '✓ Saved' : 'Save settings'}
             </button>
           </div>
         </div>
