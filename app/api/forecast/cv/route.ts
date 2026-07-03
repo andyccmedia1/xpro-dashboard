@@ -60,11 +60,23 @@ export async function GET(request: Request) {
   const cvRaw = mean > 0 ? std / mean : 0
   const cv = Math.round(Math.min(3, Math.max(0, cvRaw)) * 100) / 100
 
+  // Selling history: first day with a sale → how long the SKU has actually been
+  // selling. Used to correct diluted 60/90-day windows for recently-stocked SKUs.
+  const saleDates   = Array.from(daily.entries()).filter(([, u]) => u > 0).map(([d]) => d).sort()
+  const firstSale   = saleDates[0] ?? null
+  const sellingDays = saleDates.length
+  const historyDays = firstSale
+    ? Math.round((Date.parse(todayISO) - Date.parse(firstSale)) / 86_400_000)
+    : null
+
   return NextResponse.json({
     cv,
     days: n,
     mean: Math.round(mean * 10) / 10,
     std:  Math.round(std * 10) / 10,
     hasAmazon: !!asin,
+    first_sale:   firstSale,
+    history_days: historyDays,   // days from first sale to yesterday
+    selling_days: sellingDays,   // count of days with >0 demand
   })
 }

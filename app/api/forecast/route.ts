@@ -32,7 +32,7 @@ export async function GET(request: Request) {
 
   const { data: params } = await supabase
     .from('sku_params')
-    .select('msku, on_hand, inbounds, lead_time_days, lead_time_std_days, safety_stock_days, moq, casepack, cycle_cover_days, seasonality, demand_cv, last_forecasted')
+    .select('msku, on_hand, inbounds, lead_time_days, lead_time_std_days, safety_stock_days, moq, casepack, cycle_cover_days, seasonality, demand_cv, history_days, last_forecasted')
     .eq('brand', brand)
 
   const paramMap = new Map<string, Record<string, unknown>>()
@@ -55,6 +55,7 @@ export async function GET(request: Request) {
       cycle_cover_days:  num(p.cycle_cover_days ?? DEFAULTS.cycle_cover_days),
       seasonality:       Array.isArray(p.seasonality) && p.seasonality.length === 12 ? p.seasonality.map(num) : [],
       demand_cv:         num(p.demand_cv),
+      history_days:      num(p.history_days),
       last_forecasted:   (p.last_forecasted as string | null) ?? null,
       has_params:        paramMap.has(r.msku as string),
     }
@@ -96,6 +97,7 @@ export async function POST(request: Request) {
     inbounds,
     seasonality,
     demand_cv:          Math.max(0, num(body.demand_cv)),
+    history_days:       Math.max(0, Math.round(num(body.history_days))),
     last_forecasted:    lastForecasted,
     lead_time_days:     Math.round(num(body.lead_time_days ?? DEFAULTS.lead_time_days)),
     lead_time_std_days: Math.round(num(body.lead_time_std_days ?? DEFAULTS.lead_time_std_days)),

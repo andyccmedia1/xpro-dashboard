@@ -22,6 +22,7 @@ type Sku = {
   moq: number; casepack: number; cycle_cover_days: number
   seasonality: number[]   // per-SKU override: 12 monthly multipliers, or [] = use global
   demand_cv: number       // per-SKU demand CV override; 0 = use global
+  history_days: number    // days the SKU has actually been selling; 0 = use full window
   last_forecasted: string | null   // 'YYYY-MM-DD' — when this SKU was last forecast/reviewed
   has_params: boolean
 }
@@ -57,6 +58,11 @@ const PARAM_FIELDS = [
 const n0 = (v: number) => (Number.isFinite(v) ? Math.round(v).toLocaleString() : '—')
 const n2 = (v: number) => (Number.isFinite(v) ? v.toFixed(2) : '—')
 
+// A SKU looks recently-stocked (long windows diluted) when its 90-day units total
+// equals a shorter window's — i.e. no sales that far back. history_days corrects it.
+const isDiluted = (s: Sku) =>
+  s.history_days === 0 && s.units_90 > 0 && (s.units_90 === s.units_30 || s.units_90 === s.units_60)
+
 const DAY_MS = 86_400_000
 /** Whole days from the forecast anchor to an inbound date (null/past → null). */
 function inboundDayOffset(inboundDate: string | null, anchor: Date): number | null {
@@ -85,7 +91,19 @@ function seasonalityMap(season: Seasonality, today: Date): Record<number, number
 }
 
 function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety, season: Seasonality) {
-  const base = weightedVelocity({ v7: sku.v7, v14: sku.v14, v30: sku.v30, v60: sku.v60, v90: sku.v90 }, weights)
+  // History correction: for a recently-stocked SKU, windows longer than its
+  // selling history are diluted by pre-stock zero-demand days. Divide by the
+  // actual days selling instead of the full window so the rate isn't dragged
+  // down (units_N / min(N, history_days)). history_days = 0 → no correction.
+  const hd = sku.history_days
+  const ev = (unitsN: number, vN: number, N: number) => (hd > 0 && hd < N ? unitsN / hd : vN)
+  const base = weightedVelocity({
+    v7:  ev(sku.units_7,  sku.v7,  7),
+    v14: ev(sku.units_14, sku.v14, 14),
+    v30: ev(sku.units_30, sku.v30, 30),
+    v60: ev(sku.units_60, sku.v60, 60),
+    v90: ev(sku.units_90, sku.v90, 90),
+  }, weights)
   const deliveries = (sku.inbounds ?? [])
     .map(s => ({ day: inboundDayOffset(s.date, today), qty: s.qty }))
     .filter((d): d is { day: number; qty: number } => d.day != null && d.qty > 0)
@@ -209,6 +227,8 @@ export default function Forecast() {
   const [saveErr,   setSaveErr]   = useState('')
   const [cvBusy,    setCvBusy]    = useState<string | null>(null)   // msku currently calculating CV
   const [cvInfo,    setCvInfo]    = useState<Record<string, { cv: number; days: number; mean: number; std: number } | string>>({})
+  const [histBusy,  setHistBusy]  = useState<string | null>(null)   // msku currently detecting history
+  const [histInfo,  setHistInfo]  = useState<Record<string, { history_days: number; selling_days: number; first_sale: string | null } | string>>({})
   const detailRef = useRef<HTMLDivElement>(null)
 
   // Scroll the detail panel into view when a SKU is selected (it renders below the table)
@@ -288,6 +308,27 @@ export default function Forecast() {
     }
   }
 
+  // Detect how long this SKU has actually been selling (first sale → yesterday)
+  // and set it as history_days, which corrects diluted 60/90-day windows.
+  async function detectHistory(s: Sku) {
+    setHistBusy(s.msku)
+    try {
+      const r = await fetch(`/api/forecast/cv?msku=${encodeURIComponent(s.msku)}`)
+      const d = await r.json()
+      if (!r.ok || d.history_days == null) {
+        setHistInfo(prev => ({ ...prev, [s.msku]: d.error === 'not enough daily history'
+          ? `Not enough history (${d.days ?? 0} days)` : (d.error || 'Could not detect') }))
+      } else {
+        setEdit(s.msku, 'history_days', d.history_days)
+        setHistInfo(prev => ({ ...prev, [s.msku]: { history_days: d.history_days, selling_days: d.selling_days, first_sale: d.first_sale } }))
+      }
+    } catch {
+      setHistInfo(prev => ({ ...prev, [s.msku]: 'Could not detect' }))
+    } finally {
+      setHistBusy(null)
+    }
+  }
+
   // Refs so saveSku always reads the latest state without being re-created
   // (a stable identity keeps the auto-save effect from looping).
   const editsRef = useRef(edits); editsRef.current = edits
@@ -317,7 +358,7 @@ export default function Forecast() {
           safety_stock_days: merged.safety_stock_days,
           moq: merged.moq, casepack: merged.casepack, cycle_cover_days: merged.cycle_cover_days,
           seasonality: merged.seasonality, demand_cv: merged.demand_cv,
-          last_forecasted: merged.last_forecasted,
+          history_days: merged.history_days, last_forecasted: merged.last_forecasted,
         }),
       })
       if (!res.ok) {
@@ -541,6 +582,9 @@ export default function Forecast() {
                             {sku.seasonality?.length === 12 && (
                               <span className="text-emerald-400 text-xs" title="Custom seasonality curve">✦</span>
                             )}
+                            {isDiluted(sku) && (
+                              <span className="text-amber-400 text-[10px] font-medium px-1 rounded bg-amber-400/10" title="Recently stocked — 60/90-day windows diluted. Open and set sales history.">NEW</span>
+                            )}
                           </div>
                           {sku.asin && <div className="text-xs text-gray-600">{sku.asin}</div>}
                         </td>
@@ -659,6 +703,57 @@ export default function Forecast() {
                     ))}
                   </div>
                 )}
+              </div>
+
+              {/* Sales history correction — fixes diluted windows on recently-stocked SKUs */}
+              <div className="border-t border-gray-800 pt-4">
+                <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Sales history · this SKU</label>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => detectHistory(sel.sku)}
+                      disabled={histBusy === sel.sku.msku}
+                      className="text-xs font-medium text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+                    >
+                      {histBusy === sel.sku.msku ? 'Detecting…' : '↻ Detect from sales'}
+                    </button>
+                    {sel.sku.history_days > 0 && (
+                      <button
+                        onClick={() => { setEdit(sel.sku.msku, 'history_days', 0); setHistInfo(prev => { const c = { ...prev }; delete c[sel.sku.msku]; return c }) }}
+                        className="text-xs text-gray-500 hover:text-rose-400"
+                      >
+                        use full window
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {isDiluted(sel.sku) && (
+                  <p className="text-xs text-amber-400 mb-2">
+                    ⚠ Looks recently stocked — no sales before ~{sel.sku.units_90 === sel.sku.units_30 ? 30 : 60} days ago,
+                    so the 60/90-day windows are diluted and under-state velocity. Click <span className="text-amber-300">Detect from sales</span> to correct it.
+                  </p>
+                )}
+                <div className="flex items-center gap-3 flex-wrap">
+                  <input
+                    type="number" min={0}
+                    value={sel.sku.history_days || ''}
+                    placeholder="full"
+                    onChange={e => setEdit(sel.sku.msku, 'history_days', Math.max(0, parseInt(e.target.value) || 0))}
+                    className="w-24 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white text-center"
+                  />
+                  <span className="text-xs text-gray-500">
+                    {sel.sku.history_days > 0 ? `days selling — windows capped to ${sel.sku.history_days}d` : 'days selling (blank = use full 90-day window)'}
+                  </span>
+                  {(() => {
+                    const info = histInfo[sel.sku.msku]
+                    if (!info) return null
+                    if (typeof info === 'string') return <span className="text-xs text-amber-400">{info}</span>
+                    return <span className="text-xs text-gray-400">First sale {info.first_sale} · {info.history_days}d ago · {info.selling_days} days with sales</span>
+                  })()}
+                </div>
+                <p className="text-xs text-gray-600 mt-1">
+                  Divides each window by <span className="text-gray-400">min(window, history)</span> instead of the full window — so a SKU that came into stock N days ago isn&apos;t averaged against the empty days before it.
+                </p>
               </div>
 
               {/* Demand variability (CV) — used by the service-level safety method */}
