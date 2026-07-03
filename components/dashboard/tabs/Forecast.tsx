@@ -22,6 +22,7 @@ type Sku = {
   moq: number; casepack: number; cycle_cover_days: number
   seasonality: number[]   // per-SKU override: 12 monthly multipliers, or [] = use global
   demand_cv: number       // per-SKU demand CV override; 0 = use global
+  last_forecasted: string | null   // 'YYYY-MM-DD' — when this SKU was last forecast/reviewed
   has_params: boolean
 }
 
@@ -316,6 +317,7 @@ export default function Forecast() {
           safety_stock_days: merged.safety_stock_days,
           moq: merged.moq, casepack: merged.casepack, cycle_cover_days: merged.cycle_cover_days,
           seasonality: merged.seasonality, demand_cv: merged.demand_cv,
+          last_forecasted: merged.last_forecasted,
         }),
       })
       if (!res.ok) {
@@ -519,6 +521,7 @@ export default function Forecast() {
                     <th className="px-3 py-3 font-medium text-right">Stockout in</th>
                     <th className="px-3 py-3 font-medium">Reorder</th>
                     <th className="px-3 py-3 font-medium text-right">Suggested qty</th>
+                    <th className="px-3 py-3 font-medium text-right">Last forecast</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -563,6 +566,9 @@ export default function Forecast() {
                         <td className="px-3 py-3 text-right tabular-nums text-white font-medium">
                           {analytics.firstReorderQty > 0 ? n0(analytics.firstReorderQty) : '—'}
                         </td>
+                        <td className="px-3 py-3 text-right tabular-nums text-xs text-gray-400">
+                          {sku.last_forecasted ?? <span className="text-gray-600">—</span>}
+                        </td>
                       </tr>
                     )
                   })}
@@ -582,7 +588,27 @@ export default function Forecast() {
                     blended from 7/14/30/60/90-day actuals
                   </p>
                 </div>
-                <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 text-sm">✕</button>
+                <div className="flex items-center gap-3">
+                  <div className="text-right">
+                    <label className="block text-[10px] text-gray-500 uppercase tracking-wider">Last forecasted</label>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <input
+                        type="date"
+                        value={sel.sku.last_forecasted ?? ''}
+                        onChange={e => setEdit(sel.sku.msku, 'last_forecasted', e.target.value || null)}
+                        className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white"
+                      />
+                      <button
+                        onClick={() => setEdit(sel.sku.msku, 'last_forecasted', new Date().toLocaleDateString('en-CA'))}
+                        className="text-xs font-medium text-indigo-400 hover:text-indigo-300 px-1.5 py-1 rounded border border-gray-700 hover:bg-gray-800"
+                        title="Set to today's date"
+                      >
+                        Today
+                      </button>
+                    </div>
+                  </div>
+                  <button onClick={() => setSelected(null)} className="text-gray-500 hover:text-gray-300 text-sm self-start">✕</button>
+                </div>
               </div>
 
               {/* Scalar params */}
