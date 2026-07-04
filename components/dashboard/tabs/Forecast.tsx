@@ -168,22 +168,26 @@ export default function Forecast() {
     setSeasonFactors(f => f.map((x, idx) => (idx === i ? Math.max(0, v) : x)))
 
   // ── Global forecast settings (blend + policy/horizon/safety + global
-  //    seasonality) persisted to the forecast_settings table via the Save
-  //    button. Durable across cache clears and shared across devices. "Dirty"
-  //    is a snapshot compare, so "✓ Saved" is accurate without wiring every
+  //    seasonality) persisted to the forecast_settings table. Auto-saves 800ms
+  //    after the last change (plus a manual Save button), so tabbing away
+  //    never loses changes. Failures are surfaced, never silent. "Dirty" is a
+  //    snapshot compare, so "✓ Saved" is accurate without wiring every
   //    change handler.
   const currentSnapshot = JSON.stringify({
     weights, horizon, policy, safetyMethod, serviceLvl, demandCv, seasonOn, seasonFactors,
   })
   const [savedSnapshot,  setSavedSnapshot]  = useState<string | null>(null)
   const [settingsSaving, setSettingsSaving] = useState(false)
+  const [settingsErr,    setSettingsErr]    = useState('')
+  const settingsLoaded = useRef(false)   // don't auto-save until the initial GET settles
   const settingsSaved = savedSnapshot !== null && savedSnapshot === currentSnapshot
 
   // Load persisted settings once on mount
   useEffect(() => {
     fetch('/api/forecast/settings')
       .then(r => r.json())
-      .then(({ settings: v }) => {
+      .then(({ settings: v, error }) => {
+        if (error) { setSettingsErr(String(error)); return }
         if (!v) return
         const nWeights  = { ...DEFAULT_WEIGHTS, ...(v.weights ?? {}) }
         const nHorizon  = v.horizon ? Number(v.horizon) : 180
@@ -203,11 +207,13 @@ export default function Forecast() {
         }))
       })
       .catch(() => { /* defaults stand */ })
+      .finally(() => { settingsLoaded.current = true })
   }, [])
 
-  async function saveSettings() {
+  const saveSettings = useCallback(async () => {
     const snap = currentSnapshot
     setSettingsSaving(true)
+    setSettingsErr('')
     try {
       const res = await fetch('/api/forecast/settings', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -216,10 +222,26 @@ export default function Forecast() {
           demand_cv: demandCv, seasonality_on: seasonOn, seasonality: seasonFactors,
         }),
       })
-      if (res.ok) setSavedSnapshot(snap)
-    } catch { /* leave marked unsaved */ }
-    finally { setSettingsSaving(false) }
-  }
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}))
+        throw new Error(j.error || `HTTP ${res.status}`)
+      }
+      setSavedSnapshot(snap)
+    } catch (e) {
+      setSettingsErr(e instanceof Error ? e.message : 'Save failed')
+    } finally {
+      setSettingsSaving(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSnapshot])
+
+  // Auto-save: 800ms after the last settings change (once the initial load settled)
+  useEffect(() => {
+    if (!settingsLoaded.current) return
+    if (savedSnapshot === currentSnapshot) return
+    const t = setTimeout(() => { saveSettings() }, 800)
+    return () => clearTimeout(t)
+  }, [currentSnapshot, savedSnapshot, saveSettings])
 
   const [edits,    setEdits]    = useState<Record<string, Partial<Sku>>>({})
   const [selected, setSelected] = useState<string | null>(null)
@@ -461,10 +483,13 @@ export default function Forecast() {
             <span className={`text-xs ${Math.abs(weightSum - 1) < 0.001 ? 'text-gray-600' : 'text-amber-400'}`}>
               sum {weightSum.toFixed(2)} {Math.abs(weightSum - 1) >= 0.001 && '(auto-normalised)'}
             </span>
+            {settingsErr && (
+              <span className="text-xs text-rose-400" title={settingsErr}>⚠ Settings not saving: {settingsErr}</span>
+            )}
             <button
               onClick={saveSettings}
               disabled={settingsSaved || settingsSaving}
-              title="Save the blend weights, reorder policy, horizon, safety-stock settings and global seasonality to the database — restored on every device"
+              title="Settings auto-save as you change them; this forces a save now. Stored in the database — restored on every device."
               className="text-xs font-medium px-2.5 py-1 rounded-md border border-gray-700 text-indigo-400 hover:bg-gray-800 hover:text-indigo-300 disabled:border-transparent disabled:hover:bg-transparent disabled:text-emerald-400"
             >
               {settingsSaving ? 'Saving…' : settingsSaved ? '✓ Saved' : 'Save settings'}
