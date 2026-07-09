@@ -30,10 +30,19 @@ export async function GET(request: Request) {
   }
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
 
-  const { data: params } = await supabase
+  // Fail LOUDLY if the params query errors (e.g. a migration hasn't been run and
+  // a selected column doesn't exist). Silently falling back to defaults makes
+  // saved data look deleted — and a subsequent auto-save could overwrite it.
+  const { data: params, error: paramsError } = await supabase
     .from('sku_params')
     .select('msku, on_hand, inbounds, lead_time_days, lead_time_std_days, safety_stock_days, moq, casepack, cycle_cover_days, seasonality, demand_cv, history_days, promotions, last_forecasted')
     .eq('brand', brand)
+  if (paramsError) {
+    return NextResponse.json(
+      { error: `sku_params query failed: ${paramsError.message} — run the pending schema migration`, source: 'params' },
+      { status: 500 },
+    )
+  }
 
   const paramMap = new Map<string, Record<string, unknown>>()
   for (const p of (params ?? []) as Record<string, unknown>[]) paramMap.set(p.msku as string, p)

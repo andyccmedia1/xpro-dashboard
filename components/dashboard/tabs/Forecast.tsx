@@ -300,12 +300,17 @@ export default function Forecast() {
   // Anchor to yesterday (the last fully-complete data day) — today's data is partial.
   const today = useMemo(() => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - 1); return d }, [])
 
+  const [loadErr, setLoadErr] = useState('')
   const load = useCallback(() => {
     setLoading(true)
+    setLoadErr('')
     fetch('/api/forecast')
       .then(r => r.json())
-      .then(d => { setSkus(d.skus ?? []); setSource(d.source ?? 'ledger'); setLoading(false) })
-      .catch(() => setLoading(false))
+      .then(d => {
+        if (d.error) { setLoadErr(String(d.error)); setLoading(false); return }
+        setSkus(d.skus ?? []); setSource(d.source ?? 'ledger'); setLoading(false)
+      })
+      .catch(e => { setLoadErr(e instanceof Error ? e.message : 'Failed to load'); setLoading(false) })
   }, [])
   useEffect(() => { load() }, [load])
 
@@ -613,6 +618,12 @@ export default function Forecast() {
 
       {loading ? (
         <div className="flex items-center justify-center h-48 text-gray-500 text-sm">Loading…</div>
+      ) : loadErr ? (
+        <div className="flex flex-col items-center justify-center h-48 text-center space-y-2">
+          <p className="text-rose-400 text-sm font-medium">⚠ Forecast data failed to load — your saved data is safe</p>
+          <p className="text-gray-500 text-xs max-w-lg">{loadErr}</p>
+          <button onClick={load} className="text-xs font-medium text-indigo-400 hover:text-indigo-300 mt-1">↻ Retry</button>
+        </div>
       ) : skus.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-48 text-center space-y-2">
           <p className="text-gray-300 text-sm font-medium">No velocity data yet</p>
