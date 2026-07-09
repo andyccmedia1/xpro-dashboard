@@ -34,6 +34,7 @@ export type ForecastParams = {
   safetyStockDays?: number      // default 15
   useSeasonality?: boolean
   seasonalityFactors?: Record<number, number>  // month(1-12) -> multiplier
+  dayMultipliers?: Record<number, number>      // day index -> demand multiplier (deals/promos)
   dynamicReorder?: boolean      // default true
   reorderPolicy?: 'R_S' | 's_Q' | 'EOQ'         // default 'R_S'
   cycleCoverDays?: number       // default 35
@@ -103,14 +104,17 @@ export function runForecast(p: ForecastParams): ForecastRow[] {
   let inventory = p.initialInventory
   let backorderQty = 0
 
-  const dailyVelocity = (date: Date): number =>
-    useSeasonality ? p.baseVelocity * (seasonality[date.getMonth() + 1] ?? 1.0) : p.baseVelocity
+  const dayMult = p.dayMultipliers ?? {}
+  const dailyVelocity = (i: number): number => {
+    const seas = useSeasonality ? (seasonality[dates[i].getMonth() + 1] ?? 1.0) : 1.0
+    return p.baseVelocity * seas * (dayMult[i] ?? 1.0)
+  }
 
   const leadTimeDemand = (startDay: number, L: number): number => {
     let total = 0
     for (let k = 1; k <= L; k++) {
-      const idx = startDay + k < days ? startDay + k : Math.min(startDay + k, days - 1)
-      total += dailyVelocity(dates[idx])
+      const idx = Math.min(startDay + k, days - 1)
+      total += dailyVelocity(idx)
     }
     return total
   }
@@ -128,7 +132,7 @@ export function runForecast(p: ForecastParams): ForecastRow[] {
 
   for (let i = 0; i < days; i++) {
     const date = dates[i]
-    const todayVel = dailyVelocity(date)
+    const todayVel = dailyVelocity(i)
 
     // Deliveries arriving today (scheduled + dynamic)
     let deliveryToday = (deliveryDict[i] ?? 0) + (pending[i] ?? 0)

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceArea,
 } from 'recharts'
 import {
   weightedVelocity, runForecast, analyzeForecast,
@@ -11,6 +11,8 @@ import {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type Inbound = { date: string; qty: number }
+// A deal/promo window: demand is multiplied by `mult` from start to end (inclusive)
+type Promo = { start: string; end: string; mult: number; label: string }
 
 type Sku = {
   msku: string
@@ -23,6 +25,7 @@ type Sku = {
   seasonality: number[]   // per-SKU override: 12 monthly multipliers, or [] = use global
   demand_cv: number       // per-SKU demand CV override; 0 = use global
   history_days: number    // days the SKU has actually been selling; 0 = use full window
+  promotions: Promo[]     // planned deals/promos (demand multiplier over a date range)
   last_forecasted: string | null   // 'YYYY-MM-DD' — when this SKU was last forecast/reviewed
   has_params: boolean
 }
@@ -113,6 +116,22 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
   // Per-SKU curve overrides the global one; global toggle still gates whether any applies.
   const effFactors = sku.seasonality?.length === 12 ? sku.seasonality : season.factors
   const seasonalityFactors = seasonalityMap({ on: season.on, factors: effFactors }, today)
+  // Deals/promos → day-index demand multipliers (applied regardless of the seasonality toggle)
+  const dayOffset = (ds: string) => {
+    const d = new Date(ds + 'T00:00:00')
+    return isNaN(d.getTime()) ? null : Math.round((d.getTime() - today.getTime()) / DAY_MS)
+  }
+  const dayMultipliers: Record<number, number> = {}
+  const promoWindows: { promo: Promo; startDay: number; endDay: number }[] = []
+  for (const pr of sku.promotions ?? []) {
+    if (!pr.start || !pr.end || !(pr.mult > 0)) continue
+    const s = dayOffset(pr.start), e = dayOffset(pr.end)
+    if (s == null || e == null || e < 0 || s > e) continue
+    const cs = Math.max(0, s), ce = Math.min(horizon - 1, e)
+    if (cs > ce) continue
+    for (let d = cs; d <= ce; d++) dayMultipliers[d] = (dayMultipliers[d] ?? 1) * pr.mult
+    promoWindows.push({ promo: pr, startDay: cs, endDay: ce })
+  }
   const rows = runForecast({
     initialInventory: sku.on_hand,
     baseVelocity: base,
@@ -132,6 +151,7 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
     leadTimeStdDays: sku.lead_time_std_days,
     useSeasonality: season.on,
     seasonalityFactors,
+    dayMultipliers,
   })
   const analytics = analyzeForecast(rows)
   const daysOfCover = base > 0 ? sku.on_hand / base : Infinity
@@ -139,7 +159,25 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
   const safetyStock = useService
     ? safety.z * Math.sqrt(sigmaD * sigmaD * sku.lead_time_days + base * base * sku.lead_time_std_days * sku.lead_time_std_days)
     : base * sku.safety_stock_days
-  return { base, rows, analytics, daysOfCover, safetyStock, cv }
+
+  // Per-promo projection: units the deal moves, lost sales, and end-of-deal stock
+  const promoStats = promoWindows.map(w => {
+    const slice = rows.slice(w.startDay, w.endDay + 1)
+    const units    = slice.reduce((s, r) => s + (r.velocity - r.lostSales), 0)
+    const lost     = slice.reduce((s, r) => s + r.lostSales, 0)
+    const endInv   = slice[slice.length - 1]?.inventory ?? 0
+    const stockout = slice.some(r => r.inventory <= 0)
+    return { ...w, units, lost, endInv, stockout }
+  })
+
+  // Ad signal: throttle when the sim projects a stockout even with reorders;
+  // push when sitting on more cover than a full lead time + order cycle needs.
+  const adSignal: 'throttle' | 'steady' | 'push' =
+    analytics.firstStockoutDay != null ? 'throttle'
+    : base > 0 && sku.on_hand > 0 && daysOfCover > sku.lead_time_days + sku.cycle_cover_days ? 'push'
+    : 'steady'
+
+  return { base, rows, analytics, daysOfCover, safetyStock, cv, promoStats, adSignal }
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -291,7 +329,7 @@ export default function Forecast() {
   const sel = computed.find(c => c.sku.msku === selected) ?? null
   const selCustomSeason = (sel?.sku.seasonality?.length ?? 0) === 12
 
-  function setEdit(msku: string, key: keyof Sku, value: number | string | null | Inbound[] | number[]) {
+  function setEdit(msku: string, key: keyof Sku, value: number | string | null | Inbound[] | number[] | Promo[]) {
     setEdits(e => ({ ...e, [msku]: { ...e[msku], [key]: value } }))
     setSaveState('idle')
   }
@@ -301,6 +339,13 @@ export default function Forecast() {
   const removeInbound = (s: Sku, i: number) => setInbounds(s, (s.inbounds ?? []).filter((_, idx) => idx !== i))
   const updateInbound = (s: Sku, i: number, field: keyof Inbound, value: string | number) =>
     setInbounds(s, (s.inbounds ?? []).map((sh, idx) => (idx === i ? { ...sh, [field]: value } : sh)))
+
+  // Deals/promotions list editors
+  const setPromos   = (s: Sku, list: Promo[]) => setEdit(s.msku, 'promotions', list)
+  const addPromo    = (s: Sku) => setPromos(s, [...(s.promotions ?? []), { start: '', end: '', mult: 2, label: '' }])
+  const removePromo = (s: Sku, i: number) => setPromos(s, (s.promotions ?? []).filter((_, idx) => idx !== i))
+  const updatePromo = (s: Sku, i: number, field: keyof Promo, value: string | number) =>
+    setPromos(s, (s.promotions ?? []).map((pr, idx) => (idx === i ? { ...pr, [field]: value } : pr)))
 
   // Per-SKU seasonality override editors (empty [] = inherit the global curve)
   const enableSkuSeason = (s: Sku) => setEdit(s.msku, 'seasonality', [...seasonFactors])   // seed from global
@@ -380,7 +425,8 @@ export default function Forecast() {
           safety_stock_days: merged.safety_stock_days,
           moq: merged.moq, casepack: merged.casepack, cycle_cover_days: merged.cycle_cover_days,
           seasonality: merged.seasonality, demand_cv: merged.demand_cv,
-          history_days: merged.history_days, last_forecasted: merged.last_forecasted,
+          history_days: merged.history_days, promotions: merged.promotions,
+          last_forecasted: merged.last_forecasted,
         }),
       })
       if (!res.ok) {
@@ -586,12 +632,13 @@ export default function Forecast() {
                     <th className="px-3 py-3 font-medium text-right">Days cover</th>
                     <th className="px-3 py-3 font-medium text-right">Stockout in</th>
                     <th className="px-3 py-3 font-medium">Reorder</th>
+                    <th className="px-3 py-3 font-medium">Ad signal</th>
                     <th className="px-3 py-3 font-medium text-right">Suggested qty</th>
                     <th className="px-3 py-3 font-medium text-right">Last forecast</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map(({ sku, base, daysOfCover, analytics }) => {
+                  {rows.map(({ sku, base, daysOfCover, analytics, adSignal }) => {
                     const reorderNow = analytics.firstReorderDay != null && analytics.firstReorderDay <= 7
                     const cover = Number.isFinite(daysOfCover) ? Math.round(daysOfCover) : null
                     const isSel = selected === sku.msku
@@ -630,6 +677,17 @@ export default function Forecast() {
                             <span className="text-xs text-gray-400">by {analytics.firstReorderDate.slice(5)}</span>
                           ) : (
                             <span className="text-xs text-emerald-400">ok</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-3">
+                          {sku.on_hand === 0 && !sku.has_params ? (
+                            <span className="text-xs text-gray-600">—</span>
+                          ) : adSignal === 'throttle' ? (
+                            <span className="text-xs font-medium text-rose-400" title="Projected stockout even with reorders — cut ad spend / expedite stock">▼ throttle</span>
+                          ) : adSignal === 'push' ? (
+                            <span className="text-xs font-medium text-emerald-400" title="More cover than a full lead time + cycle needs — room to push demand">▲ push</span>
+                          ) : (
+                            <span className="text-xs text-gray-500" title="Cover and replenishment are balanced">→ steady</span>
                           )}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums text-white font-medium">
@@ -726,6 +784,75 @@ export default function Forecast() {
                                 className="text-gray-500 hover:text-rose-400 text-sm px-1" title="Remove">✕</button>
                       </div>
                     ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Deals & promotions — demand multiplier over a date range */}
+              <div className="border-t border-gray-800 pt-4">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Deals &amp; promotions</label>
+                  <button onClick={() => addPromo(sel.sku)} className="text-xs font-medium text-indigo-400 hover:text-indigo-300">
+                    + Add deal
+                  </button>
+                </div>
+                {(sel.sku.promotions ?? []).length === 0 ? (
+                  <p className="text-xs text-gray-600">
+                    No deals planned. Add one to model a promo — e.g. a Lightning Deal weekend at 2× demand — and see if stock survives it.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {(sel.sku.promotions ?? []).map((pr, i) => {
+                      const stat = sel.promoStats.find(w => w.promo === pr)
+                      return (
+                        <div key={i} className="space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <input
+                              type="text" placeholder="label (e.g. Prime Day)"
+                              value={pr.label}
+                              onChange={e => updatePromo(sel.sku, i, 'label', e.target.value)}
+                              className="w-36 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                            />
+                            <input
+                              type="date" value={pr.start}
+                              onChange={e => updatePromo(sel.sku, i, 'start', e.target.value)}
+                              className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                            />
+                            <span className="text-xs text-gray-600">→</span>
+                            <input
+                              type="date" value={pr.end}
+                              onChange={e => updatePromo(sel.sku, i, 'end', e.target.value)}
+                              className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                            />
+                            <input
+                              type="number" min={0} max={20} step={0.25}
+                              value={pr.mult}
+                              onChange={e => updatePromo(sel.sku, i, 'mult', Math.max(0, parseFloat(e.target.value) || 0))}
+                              className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white text-center"
+                              title="Demand multiplier during the deal (2 = double the normal rate)"
+                            />
+                            <span className="text-xs text-gray-600">× demand</span>
+                            <button onClick={() => removePromo(sel.sku, i)}
+                                    className="text-gray-500 hover:text-rose-400 text-sm px-1" title="Remove">✕</button>
+                          </div>
+                          {stat && (
+                            <p className="text-xs pl-1">
+                              {stat.stockout ? (
+                                <span className="text-rose-400">
+                                  ⚠ Runs dry during this deal — projected {n0(stat.units)} units sold, {n0(stat.lost)} lost to stockout.
+                                  Add inbound stock or lower the multiplier.
+                                </span>
+                              ) : (
+                                <span className="text-gray-500">
+                                  Projected <span className="text-gray-300">{n0(stat.units)} units</span> during the deal ·
+                                  ends with <span className="text-gray-300">{n0(stat.endInv)}</span> on hand
+                                </span>
+                              )}
+                            </p>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>
@@ -940,6 +1067,19 @@ export default function Forecast() {
                         return [n0(Number(v)), name]
                       }}
                     />
+                    {/* Deal windows: shaded purple bands */}
+                    {sel.promoStats.map((w, i) => (
+                      <ReferenceArea
+                        key={i}
+                        x1={sel.rows[w.startDay]?.date}
+                        x2={sel.rows[w.endDay]?.date}
+                        fill={w.stockout ? '#ef4444' : '#a855f7'}
+                        fillOpacity={0.12}
+                        stroke={w.stockout ? '#ef4444' : '#a855f7'}
+                        strokeOpacity={0.35}
+                        label={{ value: `${w.promo.label || 'deal'} ${w.promo.mult}×`, position: 'insideTop', fill: w.stockout ? '#f87171' : '#c084fc', fontSize: 10 }}
+                      />
+                    ))}
                     <Line type="monotone" dataKey="inventory" name="On-hand" stroke="#6366f1" dot={false} strokeWidth={2} />
                     <Line type="monotone" dataKey="reorderPoint" name="Reorder point" stroke="#f59e0b" dot={false} strokeDasharray="4 3" strokeWidth={1.5} />
                     {/* Star at each reorder-trigger point */}
@@ -951,7 +1091,8 @@ export default function Forecast() {
               </div>
               <p className="text-xs text-gray-600">
                 Indigo = projected on-hand · amber dashed = reorder point (lead-time demand + safety stock) ·
-                <span className="text-amber-400"> ★ = reorder placed</span> (hover for the order qty).
+                <span className="text-amber-400"> ★ = reorder placed</span> (hover for the order qty) ·
+                <span className="text-purple-400"> purple band = deal window</span> (red band = deal runs dry).
                 Each jump up is a shipment arriving — your inbound POs, plus auto-reorders landing after the lead time.
               </p>
             </div>
