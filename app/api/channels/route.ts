@@ -71,7 +71,9 @@ export async function GET(request: Request) {
     spend: {
       amazon:  { total: amzSpend,  share: totalSpend > 0 ? amzSpend  / totalSpend : 0, roas: amzSpend  > 0 ? amzRev  / amzSpend  : null },
       tiktok:  { total: ttkSpend,  share: totalSpend > 0 ? ttkSpend  / totalSpend : 0, roas: ttkSpend  > 0 ? ttkRev  / ttkSpend  : null },
-      meta:    { total: metSpend,  share: totalSpend > 0 ? metSpend  / totalSpend : 0, roas: metSpend  > 0 ? totalRev / metSpend  : null },
+      // Meta ads drive the Shopify store, so Meta ROAS = Shopify revenue ÷ Meta spend
+      // (same attribution as the Channel Efficiency table).
+      meta:    { total: metSpend,  share: totalSpend > 0 ? metSpend  / totalSpend : 0, roas: metSpend  > 0 ? shopRev / metSpend  : null },
       total:   totalSpend,
     },
   }
