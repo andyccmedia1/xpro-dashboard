@@ -95,7 +95,8 @@ _ADS_BASE_URL  = "https://advertising-api.amazon.com"
 _SP_CHUNK_DAYS = 30   # SP-API: request at most 30 days per report
 _ADS_CHUNK_DAYS = 30  # Ads API: maximum 30 days per report
 _SB_SD_RETENTION_DAYS = 59  # SB/SD data retention window
-_PPC_REFRESH_DAYS = 5  # trailing window re-pulled & overwritten each run (Ads finalises 2-3d late)
+_PPC_REFRESH_DAYS = 10  # trailing window re-pulled & overwritten each run (Ads can finalise up to ~1wk late)
+_PPC_SUSPECT_THRESHOLD = 10.0  # spend below this is a broken partial (real spend ~$600-1000/day) → re-pull as a gap
 
 # ── FBA Inventory Ledger (depletion forecasting) ───────────────────────────────
 # Event-type values in GET_LEDGER_DETAIL_VIEW_DATA that represent true customer
@@ -997,9 +998,11 @@ def auto_backfill_gaps(brand: str, lookback_days: int = 30) -> None:
 
 def find_ppc_gaps(start: date, end: date, brand: str) -> list[tuple[date, date]]:
     """
-    Find dates where amazon_revenue is present but amazon_ppc_spend is NULL.
-    These are days where SP-API succeeded but the Ads API failed or timed out.
-    Returns grouped (gap_start, gap_end) ranges.
+    Find dates where amazon_revenue is present but amazon_ppc_spend is NULL
+    OR suspiciously tiny (< _PPC_SUSPECT_THRESHOLD). Amazon sometimes serves a
+    broken partial (e.g. $1.40 on Jun 26, $0.66 on Jul 9) that is non-null, so a
+    null-only scan never revisits it. Real spend runs ~$600-1000/day, so a few
+    dollars is always a partial. Returns grouped (gap_start, gap_end) ranges.
     """
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/daily_data",
@@ -1013,7 +1016,8 @@ def find_ppc_gaps(start: date, end: date, brand: str) -> list[tuple[date, date]]
             ("date",                f"gte.{start}"),
             ("date",                f"lte.{end}"),
             ("amazon_revenue",      "not.is.null"),   # revenue exists
-            ("amazon_ppc_spend",    "is.null"),        # but PPC is missing
+            # PPC missing or a broken partial
+            ("or", f"(amazon_ppc_spend.is.null,amazon_ppc_spend.lt.{_PPC_SUSPECT_THRESHOLD})"),
         ],
         timeout=30,
     )
