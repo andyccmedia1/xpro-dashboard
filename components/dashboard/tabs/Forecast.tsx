@@ -117,7 +117,7 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
   const sigmaD = cv * base          // daily demand std as a fraction of velocity
   // Per-SKU curve overrides the global one; global toggle still gates whether any applies.
   const effFactors = sku.seasonality?.length === 12 ? sku.seasonality : season.factors
-  const seasonalityFactors = seasonalityMap({ on: season.on, factors: effFactors }, today)
+  const seasonalityFactors = seasonalityMap({ on: season.on, factors: effFactors, strip: season.strip }, today)
   // Deals/promos → day-index demand multipliers (applied regardless of the seasonality toggle)
   const dayOffset = (ds: string) => {
     const d = new Date(ds + 'T00:00:00')
