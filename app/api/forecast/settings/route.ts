@@ -19,7 +19,7 @@ export async function GET(request: Request) {
 
   const { data, error } = await supabase
     .from('forecast_settings')
-    .select('weights, horizon, policy, safety_method, service_lvl, demand_cv, seasonality_on, seasonality, season_strip_deals')
+    .select('weights, horizon, policy, safety_method, service_lvl, demand_cv, seasonality_on, seasonality, season_strip_deals, blackouts')
     .eq('brand', brand)
     .maybeSingle()
 
@@ -37,6 +37,19 @@ export async function POST(request: Request) {
     ? body.seasonality.map((v: unknown) => Math.max(0, num(v)))
     : []
 
+  // Blackout windows: [{start:'YYYY-MM-DD', end:'YYYY-MM-DD', label, kind:'factory'|'receiving'}, …]
+  const isDate = (v: unknown) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)
+  const blackouts = Array.isArray(body.blackouts)
+    ? body.blackouts
+        .map((b: { start?: unknown; end?: unknown; label?: unknown; kind?: unknown }) => ({
+          start: isDate(b.start) ? b.start : '',
+          end:   isDate(b.end)   ? b.end   : '',
+          label: b.label ? String(b.label).slice(0, 80) : '',
+          kind:  b.kind === 'receiving' ? 'receiving' : 'factory',
+        }))
+        .filter((b: { start: string; end: string }) => b.start && b.end && b.start <= b.end)
+    : []
+
   const row = {
     brand:          body.brand ?? 'xpro',
     weights,
@@ -48,6 +61,7 @@ export async function POST(request: Request) {
     seasonality_on: !!body.seasonality_on,
     seasonality,
     season_strip_deals: body.season_strip_deals !== false,   // default true
+    blackouts,
   }
 
   const supabase = createAdminClient()

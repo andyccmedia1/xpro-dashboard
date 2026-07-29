@@ -270,6 +270,7 @@ create table if not exists forecast_settings (
   seasonality_on boolean      not null default false,
   seasonality    jsonb        not null default '[]'::jsonb,   -- global 12-month curve, [] = flat
   season_strip_deals boolean  not null default true,   -- monthly factors include deal days → de-compound promos
+  blackouts      jsonb        not null default '[]'::jsonb,   -- [{start,end,label,kind:factory|receiving}, …]
   updated_at     timestamptz  not null default now()
 );
 

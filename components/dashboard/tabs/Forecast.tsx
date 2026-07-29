@@ -13,6 +13,8 @@ import {
 type Inbound = { date: string; qty: number }
 // A deal/promo window: demand is multiplied by `mult` from start to end (inclusive)
 type Promo = { start: string; end: string; mult: number; label: string }
+// A calendar constraint: factory closed (no PO placement) or FBA receiving closed
+type Blackout = { start: string; end: string; label: string; kind: 'factory' | 'receiving' }
 
 type Sku = {
   msku: string
@@ -95,7 +97,7 @@ function seasonalityMap(season: Seasonality, today: Date): Record<number, number
   return map
 }
 
-function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety, season: Seasonality) {
+function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety, season: Seasonality, blackouts: Blackout[]) {
   // History correction: for a recently-stocked SKU, windows longer than its
   // selling history are diluted by pre-stock zero-demand days. Divide by the
   // actual days selling instead of the full window so the rate isn't dragged
@@ -161,12 +163,28 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
       if (c) dayMultipliers[i] = (dayMultipliers[i] ?? 1) * c
     }
   }
+  // Blackout windows → day-index ranges within the horizon
+  const blackoutBands = (blackouts ?? [])
+    .map(b => {
+      const s = dayOffset(b.start), e = dayOffset(b.end)
+      if (s == null || e == null || e < 0 || s > e) return null
+      const cs = Math.max(0, s), ce = Math.min(horizon - 1, e)
+      return cs <= ce ? { label: b.label, kind: b.kind, startDay: cs, endDay: ce } : null
+    })
+    .filter((b): b is { label: string; kind: 'factory' | 'receiving'; startDay: number; endDay: number } => b != null)
+  const orderBlackouts   = blackoutBands.filter(b => b.kind === 'factory')
+    .map(b => ({ start: b.startDay, end: b.endDay, label: b.label }))
+  const arrivalBlackouts = blackoutBands.filter(b => b.kind === 'receiving')
+    .map(b => ({ start: b.startDay, end: b.endDay, label: b.label }))
+
   const rows = runForecast({
     initialInventory: sku.on_hand,
     baseVelocity: base,
     startDate: today,
     days: horizon,
     deliveries,
+    orderBlackouts,
+    arrivalBlackouts,
     leadTime: sku.lead_time_days,
     safetyStockDays: sku.safety_stock_days,
     cycleCoverDays: sku.cycle_cover_days,
@@ -206,7 +224,10 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
     : base > 0 && sku.on_hand > 0 && daysOfCover > sku.lead_time_days + sku.cycle_cover_days ? 'push'
     : 'steady'
 
-  return { base, rows, analytics, daysOfCover, safetyStock, cv, promoStats, adSignal }
+  // Days where blackouts changed the plan (PO pulled earlier / blocked / arrival slipped)
+  const blackoutNotes = rows.filter(r => r.reorderNote).map(r => ({ date: r.date, note: r.reorderNote }))
+
+  return { base, rows, analytics, daysOfCover, safetyStock, cv, promoStats, adSignal, blackoutBands, blackoutNotes }
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -235,6 +256,9 @@ export default function Forecast() {
     () => ({ on: seasonOn, factors: seasonFactors, strip: seasonStrip }),
     [seasonOn, seasonFactors, seasonStrip],
   )
+
+  // ── Blackout windows: factory closures / FBA receiving cutoffs (global) ─────
+  const [blackouts, setBlackouts] = useState<Blackout[]>([])
   const setMonth = (i: number, v: number) =>
     setSeasonFactors(f => f.map((x, idx) => (idx === i ? Math.max(0, v) : x)))
 
@@ -245,7 +269,7 @@ export default function Forecast() {
   //    snapshot compare, so "✓ Saved" is accurate without wiring every
   //    change handler.
   const currentSnapshot = JSON.stringify({
-    weights, horizon, policy, safetyMethod, serviceLvl, demandCv, seasonOn, seasonFactors, seasonStrip,
+    weights, horizon, policy, safetyMethod, serviceLvl, demandCv, seasonOn, seasonFactors, seasonStrip, blackouts,
   })
   const [savedSnapshot,  setSavedSnapshot]  = useState<string | null>(null)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -270,12 +294,15 @@ export default function Forecast() {
         const nFactors  = Array.isArray(v.seasonality) && v.seasonality.length === 12
           ? v.seasonality.map(Number) : Array(12).fill(1)
         const nStrip    = v.season_strip_deals !== false   // default true
+        const nBlackouts = Array.isArray(v.blackouts) ? (v.blackouts as Blackout[]) : []
         setWeights(nWeights); setHorizon(nHorizon); setPolicy(nPolicy)
         setSafetyMethod(nMethod); setServiceLvl(nSvc); setDemandCv(nCv)
         setSeasonOn(nSeasonOn); setSeasonFactors(nFactors); setSeasonStrip(nStrip)
+        setBlackouts(nBlackouts)
         setSavedSnapshot(JSON.stringify({
           weights: nWeights, horizon: nHorizon, policy: nPolicy, safetyMethod: nMethod,
           serviceLvl: nSvc, demandCv: nCv, seasonOn: nSeasonOn, seasonFactors: nFactors, seasonStrip: nStrip,
+          blackouts: nBlackouts,
         }))
       })
       .catch(() => { /* defaults stand */ })
@@ -292,7 +319,7 @@ export default function Forecast() {
         body: JSON.stringify({
           weights, horizon, policy, safety_method: safetyMethod, service_lvl: serviceLvl,
           demand_cv: demandCv, seasonality_on: seasonOn, seasonality: seasonFactors,
-          season_strip_deals: seasonStrip,
+          season_strip_deals: seasonStrip, blackouts,
         }),
       })
       if (!res.ok) {
@@ -356,9 +383,9 @@ export default function Forecast() {
   const computed = useMemo(() => {
     return skus.map(s => {
       const eff = effective(s)
-      return { sku: eff, ...computeFor(eff, weights, horizon, policy, today, safety, season) }
+      return { sku: eff, ...computeFor(eff, weights, horizon, policy, today, safety, season, blackouts) }
     })
-  }, [skus, edits, weights, horizon, policy, today, effective, safety, season])
+  }, [skus, edits, weights, horizon, policy, today, effective, safety, season, blackouts])
 
   // Sort: most urgent first (fewest days of cover)
   const rows = useMemo(
@@ -665,6 +692,75 @@ export default function Forecast() {
         </div>
       </div>
 
+      {/* ── Blackout windows (factory closures / receiving cutoffs) ── */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <div className="flex items-center justify-between flex-wrap gap-2 mb-1">
+          <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Blackout windows</h3>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => setBlackouts(b => [...b, { start: '2026-10-01', end: '2026-10-08', label: 'Golden Week', kind: 'factory' }])}
+              className="text-xs px-2 py-1 rounded-md border border-gray-700 text-gray-300 hover:bg-gray-800 hover:text-white"
+            >
+              + Golden Week
+            </button>
+            <button
+              onClick={() => setBlackouts(b => [...b, { start: '2027-01-30', end: '2027-02-17', label: 'CNY', kind: 'factory' }])}
+              className="text-xs px-2 py-1 rounded-md border border-gray-700 text-gray-300 hover:bg-gray-800 hover:text-white"
+            >
+              + CNY
+            </button>
+            <button
+              onClick={() => setBlackouts(b => [...b, { start: '', end: '', label: '', kind: 'factory' }])}
+              className="text-xs px-2 py-1 rounded-md border border-gray-700 text-indigo-400 hover:bg-gray-800 hover:text-indigo-300"
+            >
+              + Custom
+            </button>
+          </div>
+        </div>
+        <p className="text-xs text-gray-500 mb-3">
+          Calendar constraints the reorder plan must respect. <span className="text-gray-400">Factory closed</span>:
+          a PO that would land in the window is pulled earlier and flagged. <span className="text-gray-400">FBA receiving closed</span>:
+          shipment arrivals slip past the window. Both render as bands on the SKU charts.
+        </p>
+        {blackouts.length === 0 ? (
+          <p className="text-xs text-gray-600">None defined — the model assumes ordering and receiving are possible every day.</p>
+        ) : (
+          <div className="space-y-2">
+            {blackouts.map((b, i) => (
+              <div key={i} className="flex items-center gap-2 flex-wrap">
+                <input
+                  type="text" placeholder="label (e.g. Golden Week)"
+                  value={b.label}
+                  onChange={e => setBlackouts(list => list.map((x, idx) => idx === i ? { ...x, label: e.target.value } : x))}
+                  className="w-40 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+                <select
+                  value={b.kind}
+                  onChange={e => setBlackouts(list => list.map((x, idx) => idx === i ? { ...x, kind: e.target.value as Blackout['kind'] } : x))}
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-200"
+                >
+                  <option value="factory">Factory closed (no POs)</option>
+                  <option value="receiving">FBA receiving closed</option>
+                </select>
+                <input
+                  type="date" value={b.start}
+                  onChange={e => setBlackouts(list => list.map((x, idx) => idx === i ? { ...x, start: e.target.value } : x))}
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+                <span className="text-xs text-gray-600">→</span>
+                <input
+                  type="date" value={b.end}
+                  onChange={e => setBlackouts(list => list.map((x, idx) => idx === i ? { ...x, end: e.target.value } : x))}
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+                <button onClick={() => setBlackouts(list => list.filter((_, idx) => idx !== i))}
+                        className="text-gray-500 hover:text-rose-400 text-sm px-1" title="Remove">✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {loading ? (
         <div className="flex items-center justify-center h-48 text-gray-500 text-sm">Loading…</div>
       ) : loadErr ? (
@@ -840,6 +936,14 @@ export default function Forecast() {
                           onChange={e => updateInbound(sel.sku, i, 'date', e.target.value)}
                           className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
                         />
+                        {(() => {
+                          const hit = sh.date && blackouts.find(w => w.kind === 'receiving' && sh.date >= w.start && sh.date <= w.end)
+                          return hit ? (
+                            <span className="text-xs text-amber-400" title="FBA receiving is closed on this date — expect the check-in to slip past the window">
+                              ⚠ lands in {hit.label || 'receiving blackout'}
+                            </span>
+                          ) : null
+                        })()}
                         <button onClick={() => removeInbound(sel.sku, i)}
                                 className="text-gray-500 hover:text-rose-400 text-sm px-1" title="Remove">✕</button>
                       </div>
@@ -1093,6 +1197,20 @@ export default function Forecast() {
                 )}
               </p>
 
+              {/* Blackout-driven plan adjustments */}
+              {sel.blackoutNotes.length > 0 && (
+                <div className="bg-slate-800/40 border border-slate-700/60 rounded-lg px-3.5 py-2.5 space-y-1">
+                  {sel.blackoutNotes.slice(0, 4).map((n, i) => (
+                    <p key={i} className="text-xs text-amber-400">
+                      ⚠ <span className="text-gray-400">{n.date}</span> — {n.note}
+                    </p>
+                  ))}
+                  {sel.blackoutNotes.length > 4 && (
+                    <p className="text-xs text-gray-500">…and {sel.blackoutNotes.length - 4} more</p>
+                  )}
+                </div>
+              )}
+
               {/* Analytics cards */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
                 <Card label="Reorder by"  value={sel.analytics.firstReorderDate ? sel.analytics.firstReorderDate.slice(5) : '—'}
@@ -1127,6 +1245,19 @@ export default function Forecast() {
                         return [n0(Number(v)), name]
                       }}
                     />
+                    {/* Blackout windows: slate = factory closed, cyan = receiving closed */}
+                    {sel.blackoutBands.map((b, i) => (
+                      <ReferenceArea
+                        key={'blk' + i}
+                        x1={sel.rows[b.startDay]?.date}
+                        x2={sel.rows[b.endDay]?.date}
+                        fill={b.kind === 'factory' ? '#64748b' : '#06b6d4'}
+                        fillOpacity={0.10}
+                        stroke={b.kind === 'factory' ? '#64748b' : '#06b6d4'}
+                        strokeOpacity={0.3}
+                        label={{ value: b.label || (b.kind === 'factory' ? 'factory closed' : 'receiving closed'), position: 'insideBottom', fill: b.kind === 'factory' ? '#94a3b8' : '#67e8f9', fontSize: 10 }}
+                      />
+                    ))}
                     {/* Deal windows: shaded purple bands */}
                     {sel.promoStats.map((w, i) => (
                       <ReferenceArea
@@ -1152,7 +1283,9 @@ export default function Forecast() {
               <p className="text-xs text-gray-600">
                 Indigo = projected on-hand · amber dashed = reorder point (lead-time demand + safety stock) ·
                 <span className="text-amber-400"> ★ = reorder placed</span> (hover for the order qty) ·
-                <span className="text-purple-400"> purple band = deal window</span> (red band = deal runs dry).
+                <span className="text-purple-400"> purple band = deal window</span> (red band = deal runs dry) ·
+                <span className="text-slate-400"> slate band = factory closed</span> ·
+                <span className="text-cyan-400"> cyan band = FBA receiving closed</span>.
                 Each jump up is a shipment arriving — your inbound POs, plus auto-reorders landing after the lead time.
               </p>
             </div>

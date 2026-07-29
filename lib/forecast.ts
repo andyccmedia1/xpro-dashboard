@@ -35,6 +35,8 @@ export type ForecastParams = {
   useSeasonality?: boolean
   seasonalityFactors?: Record<number, number>  // month(1-12) -> multiplier
   dayMultipliers?: Record<number, number>      // day index -> demand multiplier (deals/promos)
+  orderBlackouts?:   { start: number; end: number; label?: string }[]  // POs cannot be placed (factory closed)
+  arrivalBlackouts?: { start: number; end: number; label?: string }[]  // shipments cannot land (receiving closed)
   dynamicReorder?: boolean      // default true
   reorderPolicy?: 'R_S' | 's_Q' | 'EOQ'         // default 'R_S'
   cycleCoverDays?: number       // default 35
@@ -58,6 +60,7 @@ export type ForecastRow = {
   reorderTrigger: boolean
   reorderAmount: number
   reorderArrivalDay: number
+  reorderNote: string           // blackout adjustments ('' = none)
   inventoryPosition: number
   onOrder: number
   safetyStock: number
@@ -104,6 +107,8 @@ export function runForecast(p: ForecastParams): ForecastRow[] {
   let inventory = p.initialInventory
   let backorderQty = 0
 
+  const orderBlackouts   = p.orderBlackouts   ?? []
+  const arrivalBlackouts = p.arrivalBlackouts ?? []
   const dayMult = p.dayMultipliers ?? {}
   const dailyVelocity = (i: number): number => {
     const seas = useSeasonality ? (seasonality[dates[i].getMonth() + 1] ?? 1.0) : 1.0
@@ -165,7 +170,33 @@ export function runForecast(p: ForecastParams): ForecastRow[] {
       }
 
       const reorderNeeded = invPosition <= reorderPoint && !recentReorder && i + leadTime < days
-      if (reorderNeeded) {
+
+      // Blackout constraints
+      const inOrderBlackout = orderBlackouts.find(w => i >= w.start && i <= w.end)
+      let effNeeded = reorderNeeded
+      let note = ''
+
+      if (reorderNeeded && inOrderBlackout) {
+        // Wanted to order but the factory is closed — defer (retries after the
+        // window) and flag the day so the UI can surface it.
+        rows[i] = { ...(rows[i] ?? {} as ForecastRow), reorderNote: `PO blocked — ${inOrderBlackout.label ?? 'factory blackout'}` } as ForecastRow
+        effNeeded = false
+      } else if (!reorderNeeded && !inOrderBlackout && !recentReorder && i + leadTime < days) {
+        // Snap-earlier: if tomorrow starts a factory blackout and the position
+        // would cross the reorder point before ordering is possible again,
+        // place the PO today (the last orderable day) instead.
+        const next = orderBlackouts.find(w => w.start === i + 1)
+        if (next) {
+          let projected = invPosition
+          for (let d = i + 1; d <= Math.min(next.end, days - 1); d++) projected -= dailyVelocity(d)
+          if (projected <= reorderPoint) {
+            effNeeded = true
+            note = `PO pulled earlier — would land in ${next.label ?? 'factory blackout'}`
+          }
+        }
+      }
+
+      if (effNeeded) {
         let orderQty: number
         if (policy === 'R_S') {
           const cycleDemand = todayVel * cycleCover
@@ -180,12 +211,18 @@ export function runForecast(p: ForecastParams): ForecastRow[] {
         }
         orderQty = roundToCasepack(orderQty)
         if (orderQty > 0) {
-          const arrival = i + leadTime
+          let arrival = i + leadTime
+          // Receiving blackout: shipment can't land in the window — slips past it
+          const rb = arrivalBlackouts.find(w => arrival >= w.start && arrival <= w.end)
+          if (rb) {
+            note += (note ? ' · ' : '') + `arrival slips past ${rb.label ?? 'receiving blackout'} to day ${rb.end + 1}`
+            arrival = rb.end + 1
+          }
           if (arrival < days) {
             pending[arrival] = (pending[arrival] ?? 0) + orderQty
             invPosition += orderQty
             // mark on the (soon-to-be-pushed) row
-            rows[i] = { ...(rows[i] ?? {} as ForecastRow), reorderTrigger: true, reorderAmount: orderQty, reorderArrivalDay: arrival } as ForecastRow
+            rows[i] = { ...(rows[i] ?? {} as ForecastRow), reorderTrigger: true, reorderAmount: orderQty, reorderArrivalDay: arrival, reorderNote: note } as ForecastRow
           }
         }
       }
@@ -220,6 +257,7 @@ export function runForecast(p: ForecastParams): ForecastRow[] {
       reorderTrigger: prior?.reorderTrigger ?? false,
       reorderAmount: prior?.reorderAmount ?? 0,
       reorderArrivalDay: prior?.reorderArrivalDay ?? 0,
+      reorderNote: prior?.reorderNote ?? '',
       inventoryPosition: inventory + onOrderToday - (stockoutMode === 'backorders' ? backorderQty : 0),
       onOrder: onOrderToday,
       safetyStock: curSafety,
