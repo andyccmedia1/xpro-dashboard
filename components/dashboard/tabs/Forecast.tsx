@@ -78,7 +78,9 @@ function inboundDayOffset(inboundDate: string | null, anchor: Date): number | nu
 
 type Safety = { method: SafetyMethod; z: number; cv: number }
 // 12 monthly multipliers (Jan..Dec). on=false → flat demand.
-type Seasonality = { on: boolean; factors: number[] }
+// strip: monthly factors were measured from actuals that already contain deal
+// days, so promo months are rescaled to avoid double-counting the deal lift.
+type Seasonality = { on: boolean; factors: number[]; strip: boolean }
 
 // Build the engine's month→multiplier map, normalised so the CURRENT month = 1.0.
 // baseVelocity already reflects the current month's run-rate (trailing windows),
@@ -131,6 +133,33 @@ function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: P
     if (cs > ce) continue
     for (let d = cs; d <= ce; d++) dayMultipliers[d] = (dayMultipliers[d] ?? 1) * pr.mult
     promoWindows.push({ promo: pr, startDay: cs, endDay: ce })
+  }
+
+  // De-compound deals from monthly seasonality. If the monthly curve was
+  // measured from historical actuals, deal days are already baked into the
+  // month's average (Nov 1.15 contains BFCM), so month × promo double-counts.
+  // Rescale each promo month by c = N / (N − d + Σmult) so the month's AVERAGE
+  // stays at the entered factor while the lift concentrates in the deal window:
+  // Nov 1.15 + 5d×1.75 → normal days 1.02×, deal days 1.79× (avg still 1.15).
+  if (season.on && season.strip && promoWindows.length > 0) {
+    const monthKey     = (i: number) => { const d = new Date(today.getTime() + i * DAY_MS); return d.getFullYear() * 12 + d.getMonth() }
+    const promoMultSum = new Map<number, number>()   // monthKey -> Σ mult over deal days
+    const promoDayCnt  = new Map<number, number>()   // monthKey -> # deal days
+    for (const [ds, m] of Object.entries(dayMultipliers)) {
+      const k = monthKey(Number(ds))
+      promoMultSum.set(k, (promoMultSum.get(k) ?? 0) + m)
+      promoDayCnt.set(k, (promoDayCnt.get(k) ?? 0) + 1)
+    }
+    const corr = new Map<number, number>()
+    for (const [k, sumL] of promoMultSum) {
+      const N = new Date(Math.floor(k / 12), (k % 12) + 1, 0).getDate()   // days in that month
+      const d = promoDayCnt.get(k) ?? 0
+      corr.set(k, N / (N - d + sumL))
+    }
+    for (let i = 0; i < horizon; i++) {
+      const c = corr.get(monthKey(i))
+      if (c) dayMultipliers[i] = (dayMultipliers[i] ?? 1) * c
+    }
   }
   const rows = runForecast({
     initialInventory: sku.on_hand,
@@ -201,7 +230,11 @@ export default function Forecast() {
   // ── Global seasonality: 12 monthly multipliers (persisted server-side) ──────
   const [seasonOn,      setSeasonOn]      = useState(false)
   const [seasonFactors, setSeasonFactors] = useState<number[]>(() => Array(12).fill(1))
-  const season: Seasonality = useMemo(() => ({ on: seasonOn, factors: seasonFactors }), [seasonOn, seasonFactors])
+  const [seasonStrip,   setSeasonStrip]   = useState(true)   // factors measured from actuals → strip deal days
+  const season: Seasonality = useMemo(
+    () => ({ on: seasonOn, factors: seasonFactors, strip: seasonStrip }),
+    [seasonOn, seasonFactors, seasonStrip],
+  )
   const setMonth = (i: number, v: number) =>
     setSeasonFactors(f => f.map((x, idx) => (idx === i ? Math.max(0, v) : x)))
 
@@ -212,7 +245,7 @@ export default function Forecast() {
   //    snapshot compare, so "✓ Saved" is accurate without wiring every
   //    change handler.
   const currentSnapshot = JSON.stringify({
-    weights, horizon, policy, safetyMethod, serviceLvl, demandCv, seasonOn, seasonFactors,
+    weights, horizon, policy, safetyMethod, serviceLvl, demandCv, seasonOn, seasonFactors, seasonStrip,
   })
   const [savedSnapshot,  setSavedSnapshot]  = useState<string | null>(null)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -236,12 +269,13 @@ export default function Forecast() {
         const nSeasonOn = !!v.seasonality_on
         const nFactors  = Array.isArray(v.seasonality) && v.seasonality.length === 12
           ? v.seasonality.map(Number) : Array(12).fill(1)
+        const nStrip    = v.season_strip_deals !== false   // default true
         setWeights(nWeights); setHorizon(nHorizon); setPolicy(nPolicy)
         setSafetyMethod(nMethod); setServiceLvl(nSvc); setDemandCv(nCv)
-        setSeasonOn(nSeasonOn); setSeasonFactors(nFactors)
+        setSeasonOn(nSeasonOn); setSeasonFactors(nFactors); setSeasonStrip(nStrip)
         setSavedSnapshot(JSON.stringify({
           weights: nWeights, horizon: nHorizon, policy: nPolicy, safetyMethod: nMethod,
-          serviceLvl: nSvc, demandCv: nCv, seasonOn: nSeasonOn, seasonFactors: nFactors,
+          serviceLvl: nSvc, demandCv: nCv, seasonOn: nSeasonOn, seasonFactors: nFactors, seasonStrip: nStrip,
         }))
       })
       .catch(() => { /* defaults stand */ })
@@ -258,6 +292,7 @@ export default function Forecast() {
         body: JSON.stringify({
           weights, horizon, policy, safety_method: safetyMethod, service_lvl: serviceLvl,
           demand_cv: demandCv, seasonality_on: seasonOn, seasonality: seasonFactors,
+          season_strip_deals: seasonStrip,
         }),
       })
       if (!res.ok) {
@@ -586,11 +621,25 @@ export default function Forecast() {
             ))}
           </div>
         </div>
-        <p className="text-xs text-gray-500 mb-3">
+        <p className="text-xs text-gray-500 mb-2">
           Monthly demand multiplier — <span className="text-gray-400">1.0 = your current run-rate</span>.
           {' '}Normalised so <span className="text-amber-400">{MONTHS[today.getMonth()]}</span> (the period your velocity is measured in) anchors to 1.0;
           other months scale relative to it. Applied to reorder timing &amp; stockout dates.
         </p>
+        <label className={`flex items-start gap-2 mb-3 cursor-pointer select-none ${seasonOn ? '' : 'opacity-40 pointer-events-none'}`}>
+          <input
+            type="checkbox"
+            checked={seasonStrip}
+            onChange={e => setSeasonStrip(e.target.checked)}
+            className="accent-indigo-500 w-3.5 h-3.5 mt-0.5"
+          />
+          <span className="text-xs text-gray-500">
+            <span className="text-gray-400">Factors measured from actuals</span> — deal days are already inside the
+            monthly averages, so promo months are rescaled to avoid double-counting (e.g. Nov 1.15 + 5-day 1.75× BFCM →
+            normal days 1.02×, deal days 1.79×; the month still averages 1.15). Untick only if your factors are
+            deal-stripped baselines.
+          </span>
+        </label>
         <div className={`grid grid-cols-6 sm:grid-cols-12 gap-2 ${seasonOn ? '' : 'opacity-40 pointer-events-none'}`}>
           {seasonFactors.map((f, i) => {
             const maxF = Math.max(1, ...seasonFactors)

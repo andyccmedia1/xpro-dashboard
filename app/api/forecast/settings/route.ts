@@ -19,7 +19,7 @@ export async function GET(request: Request) {
 
   const { data, error } = await supabase
     .from('forecast_settings')
-    .select('weights, horizon, policy, safety_method, service_lvl, demand_cv, seasonality_on, seasonality')
+    .select('weights, horizon, policy, safety_method, service_lvl, demand_cv, seasonality_on, seasonality, season_strip_deals')
     .eq('brand', brand)
     .maybeSingle()
 
@@ -47,6 +47,7 @@ export async function POST(request: Request) {
     demand_cv:      Math.max(0, num(body.demand_cv)),
     seasonality_on: !!body.seasonality_on,
     seasonality,
+    season_strip_deals: body.season_strip_deals !== false,   // default true
   }
 
   const supabase = createAdminClient()
