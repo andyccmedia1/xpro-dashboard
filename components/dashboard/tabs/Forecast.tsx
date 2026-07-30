@@ -348,9 +348,9 @@ export default function Forecast() {
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [saveErr,   setSaveErr]   = useState('')
   const [cvBusy,    setCvBusy]    = useState<string | null>(null)   // msku currently calculating CV
-  const [cvInfo,    setCvInfo]    = useState<Record<string, { cv: number; days: number; mean: number; std: number } | string>>({})
+  const [cvInfo,    setCvInfo]    = useState<Record<string, { cv: number; days: number; mean: number; std: number; oos_days: number; cv_raw: number } | string>>({})
   const [histBusy,  setHistBusy]  = useState<string | null>(null)   // msku currently detecting history
-  const [histInfo,  setHistInfo]  = useState<Record<string, { history_days: number; selling_days: number; first_sale: string | null } | string>>({})
+  const [histInfo,  setHistInfo]  = useState<Record<string, { history_days: number; selling_days: number; first_sale: string | null; oos_days: number } | string>>({})
   const detailRef = useRef<HTMLDivElement>(null)
 
   // Scroll the detail panel into view when a SKU is selected (it renders below the table)
@@ -433,7 +433,7 @@ export default function Forecast() {
           ? `Not enough history (${d.days ?? 0} days)` : (d.error || 'Could not calculate') }))
       } else {
         setEdit(s.msku, 'demand_cv', d.cv)
-        setCvInfo(prev => ({ ...prev, [s.msku]: { cv: d.cv, days: d.days, mean: d.mean, std: d.std } }))
+        setCvInfo(prev => ({ ...prev, [s.msku]: { cv: d.cv, days: d.days, mean: d.mean, std: d.std, oos_days: d.oos_days ?? 0, cv_raw: d.cv_raw ?? d.cv } }))
       }
     } catch {
       setCvInfo(prev => ({ ...prev, [s.msku]: 'Could not calculate' }))
@@ -453,8 +453,9 @@ export default function Forecast() {
         setHistInfo(prev => ({ ...prev, [s.msku]: d.error === 'not enough daily history'
           ? `Not enough history (${d.days ?? 0} days)` : (d.error || 'Could not detect') }))
       } else {
-        setEdit(s.msku, 'history_days', d.history_days)
-        setHistInfo(prev => ({ ...prev, [s.msku]: { history_days: d.history_days, selling_days: d.selling_days, first_sale: d.first_sale } }))
+        // Net of suspected mid-life stockout runs, so OOS gaps don't deflate velocity
+        setEdit(s.msku, 'history_days', d.history_days_net ?? d.history_days)
+        setHistInfo(prev => ({ ...prev, [s.msku]: { history_days: d.history_days, selling_days: d.selling_days, first_sale: d.first_sale, oos_days: d.oos_days ?? 0 } }))
       }
     } catch {
       setHistInfo(prev => ({ ...prev, [s.msku]: 'Could not detect' }))
@@ -1064,7 +1065,14 @@ export default function Forecast() {
                     const info = histInfo[sel.sku.msku]
                     if (!info) return null
                     if (typeof info === 'string') return <span className="text-xs text-amber-400">{info}</span>
-                    return <span className="text-xs text-gray-400">First sale {info.first_sale} · {info.history_days}d ago · {info.selling_days} days with sales</span>
+                    return (
+                      <span className="text-xs text-gray-400">
+                        First sale {info.first_sale} · {info.history_days}d ago · {info.selling_days} days with sales
+                        {info.oos_days > 0 && (
+                          <span className="text-amber-400"> · {info.oos_days} suspected OOS days excluded → {info.history_days - info.oos_days} selling days</span>
+                        )}
+                      </span>
+                    )
                   })()}
                 </div>
                 <p className="text-xs text-gray-600 mt-1">
@@ -1108,7 +1116,14 @@ export default function Forecast() {
                     const info = cvInfo[sel.sku.msku]
                     if (!info) return null
                     if (typeof info === 'string') return <span className="text-xs text-amber-400">{info}</span>
-                    return <span className="text-xs text-gray-400">From {info.days} days: mean {n0(info.mean)}/day · σ {n0(info.std)}/day → CV {info.cv}</span>
+                    return (
+                      <span className="text-xs text-gray-400">
+                        From {info.days} days: mean {n0(info.mean)}/day · σ {n0(info.std)}/day → CV {info.cv}
+                        {info.oos_days > 0 && (
+                          <span className="text-amber-400"> · dropped {info.oos_days} suspected OOS days (naive CV {info.cv_raw})</span>
+                        )}
+                      </span>
+                    )
                   })()}
                 </div>
                 <p className="text-xs text-gray-600 mt-1">

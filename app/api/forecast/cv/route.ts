@@ -47,21 +47,11 @@ export async function GET(request: Request) {
     }
   }
 
-  const series = Array.from(daily.values())
-  const n = series.length
-  if (n < 7) {
-    return NextResponse.json({ error: 'not enough daily history', days: n }, { status: 422 })
+  if (daily.size < 7) {
+    return NextResponse.json({ error: 'not enough daily history', days: daily.size }, { status: 422 })
   }
 
-  const mean = series.reduce((s, v) => s + v, 0) / n
-  // Sample standard deviation (n-1).
-  const variance = series.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1)
-  const std = Math.sqrt(variance)
-  const cvRaw = mean > 0 ? std / mean : 0
-  const cv = Math.round(Math.min(3, Math.max(0, cvRaw)) * 100) / 100
-
-  // Selling history: first day with a sale → how long the SKU has actually been
-  // selling. Used to correct diluted 60/90-day windows for recently-stocked SKUs.
+  // Selling history span: first day with a sale → yesterday.
   const saleDates   = Array.from(daily.entries()).filter(([, u]) => u > 0).map(([d]) => d).sort()
   const firstSale   = saleDates[0] ?? null
   const sellingDays = saleDates.length
@@ -69,14 +59,67 @@ export async function GET(request: Request) {
     ? Math.round((Date.parse(todayISO) - Date.parse(firstSale)) / 86_400_000)
     : null
 
+  // Build a CONTINUOUS daily series from first sale → yesterday, filling missing
+  // dates as 0 (the S&T report omits zero-activity days, so absent = no sales).
+  const series: number[] = []
+  if (firstSale) {
+    for (let t = Date.parse(firstSale); t < Date.parse(todayISO); t += 86_400_000) {
+      series.push(daily.get(new Date(t).toISOString().slice(0, 10)) ?? 0)
+    }
+  }
+
+  // Suspected-stockout exclusion. We have no daily inventory history (the
+  // ledger report is blocked), so use a statistical proxy: for a SKU whose
+  // selling-day mean is >= 3/day, a run of >= 3 consecutive zero days is
+  // overwhelmingly out-of-stock, not demand (Poisson P(0)^3 is negligible).
+  // Drop those runs from BOTH the mean/σ and the selling-days denominator;
+  // keep isolated zeros — those are genuine zero-demand observations. Slow
+  // movers skip the heuristic (natural zero runs are expected for them).
+  const meanSelling = sellingDays > 0
+    ? saleDates.reduce((s, d) => s + (daily.get(d) ?? 0), 0) / sellingDays
+    : 0
+  const OOS_RUN = 3
+  let oosDays = 0
+  let kept: number[] = series
+  if (meanSelling >= 3) {
+    kept = []
+    let i = 0
+    while (i < series.length) {
+      if (series[i] === 0) {
+        let j = i
+        while (j < series.length && series[j] === 0) j++
+        if (j - i >= OOS_RUN) oosDays += j - i          // suspected OOS run → drop
+        else for (let k = i; k < j; k++) kept.push(0)    // isolated zeros → real demand
+        i = j
+      } else {
+        kept.push(series[i]); i++
+      }
+    }
+  }
+
+  const stats = (xs: number[]) => {
+    const n = xs.length
+    if (n < 2) return { mean: 0, std: 0, cv: 0 }
+    const mean = xs.reduce((s, v) => s + v, 0) / n
+    const std  = Math.sqrt(xs.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1))
+    return { mean, std, cv: mean > 0 ? std / mean : 0 }
+  }
+  const filtered = stats(kept)
+  const raw      = stats(series)
+  const round2 = (v: number) => Math.round(Math.min(3, Math.max(0, v)) * 100) / 100
+
   return NextResponse.json({
-    cv,
-    days: n,
-    mean: Math.round(mean * 10) / 10,
-    std:  Math.round(std * 10) / 10,
+    cv:     round2(filtered.cv),
+    days:   kept.length,
+    mean:   Math.round(filtered.mean * 10) / 10,
+    std:    Math.round(filtered.std * 10) / 10,
+    cv_raw:   round2(raw.cv),          // what the naive calc would say
+    mean_raw: Math.round(raw.mean * 10) / 10,
+    oos_days: oosDays,                 // zero-run days excluded as suspected stockouts
     hasAmazon: !!asin,
     first_sale:   firstSale,
-    history_days: historyDays,   // days from first sale to yesterday
-    selling_days: sellingDays,   // count of days with >0 demand
+    history_days: historyDays,                                        // first sale → yesterday (gross)
+    history_days_net: historyDays != null ? historyDays - oosDays : null,  // minus suspected OOS
+    selling_days: sellingDays,
   })
 }
