@@ -1066,23 +1066,29 @@ def auto_backfill_ppc_gaps(brand: str, lookback_days: int = 30) -> None:
     for gs, ge in gaps:
         log.info(f"    {gs} → {ge}")
 
-    for gs, ge in gaps:
-        log.info(f"Re-pulling Ads API for {gs} → {ge}…")
-        try:
-            all_spend = ads_pull_range(gs, ge)
-            rows = [
-                {"date": target.strftime("%Y-%m-%d"), "brand": brand,
-                 "amazon_ppc_spend": all_spend[target.strftime("%Y-%m-%d")]}
-                for target in date_range(gs, ge)
-                if target.strftime("%Y-%m-%d") in all_spend
-            ]
-            if rows:
-                supabase_upsert("daily_data", rows)
-                log.info(f"  ✓ Filled PPC for {len(rows)} day(s)")
-            else:
-                log.info(f"  Ads API returned no spend data for {gs}→{ge} — skipping")
-        except Exception as exc:
-            log.error(f"  Ads API re-pull failed for {gs}→{ge}: {exc}")
+    # Coalesce all gaps into ONE wide ranged pull. Empirically, wide ranged
+    # reports (like manual backfills) return complete data, while narrow
+    # single-day requests intermittently come back missing the SP rows —
+    # leaving the $1-4 "SB/SD-only" partial days. One wide request also uses
+    # far less createReport quota than one request per gap.
+    span_start, span_end = gaps[0][0], gaps[-1][1]
+    log.info(f"Re-pulling Ads API for the full span {span_start} → {span_end} (covers all gaps)…")
+    try:
+        all_spend = ads_pull_range(span_start, span_end)
+        gap_days = [d for gs, ge in gaps for d in date_range(gs, ge)]
+        rows = [
+            {"date": d.strftime("%Y-%m-%d"), "brand": brand,
+             "amazon_ppc_spend": all_spend[d.strftime("%Y-%m-%d")]}
+            for d in gap_days
+            if all_spend.get(d.strftime("%Y-%m-%d"), 0) > 0
+        ]
+        if rows:
+            supabase_upsert("daily_data", rows)
+            log.info(f"  ✓ Filled PPC for {len(rows)}/{len(gap_days)} gap day(s)")
+        else:
+            log.info(f"  Ads API returned no spend data for the gap days — skipping")
+    except Exception as exc:
+        log.error(f"  Ads API re-pull failed for {span_start}→{span_end}: {exc}")
 
 
 def refresh_recent_ppc(brand: str, days: int = 5) -> None:
