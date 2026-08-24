@@ -43,6 +43,7 @@ export default function Overview({ start, end, brand = 'xpro' }: Props) {
   const [aiText,    setAiText]    = useState('')
   const [aiState,   setAiState]   = useState<'idle' | 'running' | 'done' | 'error'>('idle')
   const [aiErr,     setAiErr]     = useState('')
+  const [aiModel,   setAiModel]   = useState('')
   const aiPanelRef = useRef<HTMLDivElement>(null)
 
   async function runInsights() {
@@ -59,6 +60,7 @@ export default function Overview({ start, end, brand = 'xpro' }: Props) {
       if (!res.ok || !res.body) {
         throw new Error(await res.text().catch(() => `HTTP ${res.status}`))
       }
+      setAiModel(res.headers.get('X-Model') ?? '')
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       for (;;) {
@@ -122,7 +124,7 @@ export default function Overview({ start, end, brand = 'xpro' }: Props) {
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2">
               <span className="text-indigo-400">✦</span> AI Insights
-              <span className="text-xs font-normal text-gray-500">{start} → {end} · Claude</span>
+              <span className="text-xs font-normal text-gray-500">{start} → {end} · {aiModel || 'Claude'}</span>
             </h3>
             {aiState === 'running' && <span className="text-xs text-indigo-400 animate-pulse">thinking…</span>}
             {aiState === 'done' && (

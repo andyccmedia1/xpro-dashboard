@@ -37,9 +37,10 @@ export async function POST(request: Request) {
     skus: body.skus.slice(0, 200),
   }
 
+  const MODEL = 'claude-opus-5'
   const client = new Anthropic()
   const stream = client.messages.stream({
-    model: 'claude-opus-5',
+    model: MODEL,
     max_tokens: 16000,
     thinking: { type: 'adaptive' },
     system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
@@ -67,6 +68,6 @@ export async function POST(request: Request) {
   })
 
   return new Response(readable, {
-    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Model': MODEL },
   })
 }

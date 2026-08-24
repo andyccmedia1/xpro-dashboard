@@ -357,6 +357,7 @@ export default function Forecast() {
   const [aiText,  setAiText]  = useState('')
   const [aiState, setAiState] = useState<'idle' | 'running' | 'done' | 'error'>('idle')
   const [aiErr,   setAiErr]   = useState('')
+  const [aiModel, setAiModel] = useState('')
 
   // Scroll the detail panel into view when a SKU is selected (it renders below the table)
   useEffect(() => {
@@ -442,6 +443,7 @@ export default function Forecast() {
         body: JSON.stringify(payload),
       })
       if (!res.ok || !res.body) throw new Error(await res.text().catch(() => `HTTP ${res.status}`))
+      setAiModel(res.headers.get('X-Model') ?? '')
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       for (;;) {
@@ -663,7 +665,7 @@ export default function Forecast() {
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2">
               <span className="text-indigo-400">✦</span> Reorder-Plan Review
-              <span className="text-xs font-normal text-gray-500">{computed.length} SKUs · Claude</span>
+              <span className="text-xs font-normal text-gray-500">{computed.length} SKUs · {aiModel || 'Claude'}</span>
             </h3>
             {aiState === 'running' && <span className="text-xs text-indigo-400 animate-pulse">thinking…</span>}
             {aiState === 'done' && (
