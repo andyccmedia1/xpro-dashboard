@@ -353,6 +353,11 @@ export default function Forecast() {
   const [histInfo,  setHistInfo]  = useState<Record<string, { history_days: number; selling_days: number; first_sale: string | null; oos_days: number } | string>>({})
   const detailRef = useRef<HTMLDivElement>(null)
 
+  // ── AI Insights (Claude) — reviews the reorder plan ─────────────────────────
+  const [aiText,  setAiText]  = useState('')
+  const [aiState, setAiState] = useState<'idle' | 'running' | 'done' | 'error'>('idle')
+  const [aiErr,   setAiErr]   = useState('')
+
   // Scroll the detail panel into view when a SKU is selected (it renders below the table)
   useEffect(() => {
     setSaveState('idle')
@@ -395,6 +400,61 @@ export default function Forecast() {
 
   const sel = computed.find(c => c.sku.msku === selected) ?? null
   const selCustomSeason = (sel?.sku.seasonality?.length ?? 0) === 12
+
+  // Send the on-screen forecast state (exactly what the tab computed) to Claude
+  async function runInsights() {
+    setAiState('running')
+    setAiText('')
+    setAiErr('')
+    const payload = {
+      today: today.toLocaleDateString('en-CA'),
+      settings: {
+        policy, horizon, safety_method: safetyMethod,
+        service_lvl: safetyMethod === 'service' ? serviceLvl : undefined,
+        seasonality_on: seasonOn, blackouts,
+      },
+      skus: computed.map(c => ({
+        sku: c.sku.msku,
+        vel_day: Math.round(c.base * 100) / 100,
+        on_hand: c.sku.on_hand,
+        days_cover: Number.isFinite(c.daysOfCover) ? Math.round(c.daysOfCover) : null,
+        lead_time_days: c.sku.lead_time_days,
+        lead_time_std_days: c.sku.lead_time_std_days,
+        safety_stock_units: Math.round(c.safetyStock),
+        demand_cv: Math.round(c.cv * 100) / 100,
+        history_days: c.sku.history_days || null,
+        reorder_by: c.analytics.firstReorderDate,
+        reorder_qty: c.analytics.firstReorderQty || null,
+        stockout: c.analytics.firstStockoutDate,
+        reorders_in_horizon: c.analytics.reorderCount,
+        ad_signal: c.adSignal,
+        inbounds: c.sku.inbounds,
+        promotions: c.sku.promotions,
+        blackout_flags: c.blackoutNotes.map(n => `${n.date}: ${n.note}`),
+        has_params: c.sku.has_params,
+        last_forecasted: c.sku.last_forecasted,
+      })),
+    }
+    try {
+      const res = await fetch('/api/insights/forecast', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!res.ok || !res.body) throw new Error(await res.text().catch(() => `HTTP ${res.status}`))
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        setAiText(t => t + decoder.decode(value, { stream: true }))
+      }
+      setAiState('done')
+    } catch (e) {
+      setAiState('error')
+      setAiErr(e instanceof Error ? e.message : 'Analysis failed')
+    }
+  }
 
   function setEdit(msku: string, key: keyof Sku, value: number | string | null | Inbound[] | number[] | Promo[]) {
     setEdits(e => ({ ...e, [msku]: { ...e[msku], [key]: value } }))
@@ -538,8 +598,16 @@ export default function Forecast() {
             windows end yesterday. Enter on-hand &amp; lead time per SKU to get reorder recommendations.
           </p>
         </div>
-        <div className="flex gap-2 items-center text-xs">
-          <span className="text-gray-500">Reorder policy</span>
+        <div className="flex gap-2 items-center text-xs flex-wrap">
+          <button
+            onClick={runInsights}
+            disabled={aiState === 'running' || loading || skus.length === 0}
+            title="Send the current forecast state to Claude for a reorder-plan review"
+            className="px-3 py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition"
+          >
+            {aiState === 'running' ? '✦ Reviewing…' : '✦ AI Insights'}
+          </button>
+          <span className="text-gray-500 ml-2">Reorder policy</span>
           <select
             value={policy}
             onChange={e => setPolicy(e.target.value as Policy)}
@@ -588,6 +656,29 @@ export default function Forecast() {
           )}
         </div>
       </div>
+
+      {/* ── AI Insights panel ─────────────────────────────────── */}
+      {aiState !== 'idle' && (
+        <div className="bg-gray-900 border border-indigo-900/60 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+              <span className="text-indigo-400">✦</span> Reorder-Plan Review
+              <span className="text-xs font-normal text-gray-500">{computed.length} SKUs · Claude</span>
+            </h3>
+            {aiState === 'running' && <span className="text-xs text-indigo-400 animate-pulse">thinking…</span>}
+            {aiState === 'done' && (
+              <button onClick={runInsights} className="text-xs text-gray-500 hover:text-gray-300">↻ Regenerate</button>
+            )}
+          </div>
+          {aiState === 'error' ? (
+            <p className="text-sm text-rose-400">⚠ {aiErr}</p>
+          ) : aiText === '' ? (
+            <p className="text-sm text-gray-500 animate-pulse">Reading every SKU&apos;s forecast and thinking — this can take a minute…</p>
+          ) : (
+            <div className="text-sm text-gray-300 leading-relaxed whitespace-pre-wrap">{aiText}</div>
+          )}
+        </div>
+      )}
 
       {/* ── Velocity weights ────────────────────────────────── */}
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
