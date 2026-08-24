@@ -1,6 +1,7 @@
 'use client'
 
 import { useQuery } from '@tanstack/react-query'
+import { useRef, useState } from 'react'
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, Legend,
@@ -38,6 +39,40 @@ export default function Overview({ start, end, brand = 'xpro' }: Props) {
     queryFn: () => fetchOverview(start, end, brand),
   })
 
+  // ── AI Insights (Claude) ──────────────────────────────────────────────────
+  const [aiText,    setAiText]    = useState('')
+  const [aiState,   setAiState]   = useState<'idle' | 'running' | 'done' | 'error'>('idle')
+  const [aiErr,     setAiErr]     = useState('')
+  const aiPanelRef = useRef<HTMLDivElement>(null)
+
+  async function runInsights() {
+    setAiState('running')
+    setAiText('')
+    setAiErr('')
+    setTimeout(() => aiPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 100)
+    try {
+      const res = await fetch('/api/insights', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ start, end, brand }),
+      })
+      if (!res.ok || !res.body) {
+        throw new Error(await res.text().catch(() => `HTTP ${res.status}`))
+      }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        setAiText(t => t + decoder.decode(value, { stream: true }))
+      }
+      setAiState('done')
+    } catch (e) {
+      setAiState('error')
+      setAiErr(e instanceof Error ? e.message : 'Analysis failed')
+    }
+  }
+
   const kpis = data?.kpis
   const series = data?.series ?? []
 
@@ -63,13 +98,46 @@ export default function Overview({ start, end, brand = 'xpro' }: Props) {
             {start} → {end} · All channels
           </p>
         </div>
-        {isLoading && (
-          <span className="text-xs text-gray-500 animate-pulse">Loading…</span>
-        )}
-        {error && (
-          <span className="text-xs text-red-400">Failed to load data</span>
-        )}
+        <div className="flex items-center gap-3">
+          {isLoading && (
+            <span className="text-xs text-gray-500 animate-pulse">Loading…</span>
+          )}
+          {error && (
+            <span className="text-xs text-red-400">Failed to load data</span>
+          )}
+          <button
+            onClick={runInsights}
+            disabled={aiState === 'running'}
+            title="Send this period's data to Claude for analysis and recommendations"
+            className="px-3.5 py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition"
+          >
+            {aiState === 'running' ? '✦ Analysing…' : '✦ AI Insights'}
+          </button>
+        </div>
       </div>
+
+      {/* ── AI Insights panel ── */}
+      {aiState !== 'idle' && (
+        <div ref={aiPanelRef} className="bg-gray-900 border border-indigo-900/60 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+              <span className="text-indigo-400">✦</span> AI Insights
+              <span className="text-xs font-normal text-gray-500">{start} → {end} · Claude</span>
+            </h3>
+            {aiState === 'running' && <span className="text-xs text-indigo-400 animate-pulse">thinking…</span>}
+            {aiState === 'done' && (
+              <button onClick={runInsights} className="text-xs text-gray-500 hover:text-gray-300">↻ Regenerate</button>
+            )}
+          </div>
+          {aiState === 'error' ? (
+            <p className="text-sm text-rose-400">⚠ {aiErr}</p>
+          ) : aiText === '' ? (
+            <p className="text-sm text-gray-500 animate-pulse">Reading the period&apos;s data and thinking — this can take a minute…</p>
+          ) : (
+            <div className="text-sm text-gray-300 leading-relaxed whitespace-pre-wrap">{aiText}</div>
+          )}
+        </div>
+      )}
 
       {/* ── KPI cards ── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
