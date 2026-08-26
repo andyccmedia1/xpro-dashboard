@@ -19,12 +19,10 @@ const CHANNELS = [
 
 function parseDate(raw: string): Date | null {
   if (!raw || raw === '-') return null
-  // YYYY-MM-DD HH:MM:SS — TikTok Ads export includes a timestamp, strip it
-  const withTimestamp = raw.match(/^(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}$/)
-  if (withTimestamp) {
-    const dt = new Date(withTimestamp[1] + 'T00:00:00')
-    return isNaN(dt.getTime()) ? null : dt
-  }
+  // "…date… HH:MM(:SS)" — settlement/ads exports append a timestamp; strip it
+  // and parse the date part (works for YYYY-MM-DD and DD/MM/YYYY alike)
+  const withTimestamp = raw.match(/^(.+?)\s+\d{1,2}:\d{2}(?::\d{2})?$/)
+  if (withTimestamp) return parseDate(withTimestamp[1].trim())
   // DD/MM/YYYY or D/M/YYYY — TikTok Shop exports European format
   const dmy = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
   if (dmy) {
@@ -37,33 +35,50 @@ function parseDate(raw: string): Date | null {
   return isNaN(dt.getTime()) ? null : dt
 }
 
+// Date-column matcher. Exact names first; then fuzzy: any header containing the
+// word "date" or ending in "time" ("Date (UTC)", "Order settled time",
+// "Order created time"). Metadata cells like "analysis date: 2026-08-01"
+// contain ':' and are excluded.
+const DATE_COLS_EXACT = ['date', 'day', 'by day', 'report date', 'week', 'month']
+const isDateHeader = (h: string) =>
+  DATE_COLS_EXACT.includes(h) ||
+  (!h.includes(':') && (/(^|[\s/(])date([\s)/]|$)/.test(h) || /(^|[\s/])time$/.test(h)))
+
 // Core parser operating on a cell grid — fed by CSV text or an Excel sheet.
 function parseTable(grid: string[][], channel: string): { rows: {date:string,value:number}[]; errors: string[] } {
   if (grid.length < 2) return { rows: [], errors: ['File has no data rows'] }
 
-  // Scan up to 25 rows to find the actual header row.
+  // Scan up to 40 rows to find the actual header row.
   // TikTok Shop exports have 8 rows of metadata before the real "Date,GMV,…" header.
   let headerLineIdx = -1
   let headers: string[] = []
-  for (let i = 0; i < Math.min(grid.length, 25); i++) {
+  for (let i = 0; i < Math.min(grid.length, 40); i++) {
     const cols = grid[i].map(h => h.replace(/"/g, '').trim().toLowerCase())
-    // Match common date column names exactly (avoid partial matches like "analysis date: …")
-    const DATE_COLS = ['date', 'day', 'by day', 'report date', 'week', 'month']
-    if (cols.some(h => DATE_COLS.includes(h))) {
+    if (cols.some(isDateHeader)) {
       headerLineIdx = i
       headers = cols
       break
     }
   }
-  if (headerLineIdx === -1) return { rows: [], errors: ['Could not find a header row with a Date column'] }
+  if (headerLineIdx === -1) {
+    // Show what we DID see, so the fix is obvious from the error itself
+    const seen = grid.slice(0, 3)
+      .map(r => r.filter(c => c.trim() !== '').slice(0, 6).join(' | '))
+      .filter(Boolean)
+    return { rows: [], errors: [
+      'Could not find a header row with a Date column.',
+      ...seen.map((s, i) => `Row ${i + 1}: ${s.slice(0, 140)}`),
+    ] }
+  }
 
-  const DATE_COLS = ['date', 'day', 'by day', 'report date', 'week', 'month']
-  const dateIdx = headers.findIndex(h => DATE_COLS.includes(h))
+  // Prefer an exact date-column name; fall back to the first fuzzy match
+  let dateIdx = headers.findIndex(h => DATE_COLS_EXACT.includes(h))
+  if (dateIdx === -1) dateIdx = headers.findIndex(isDateHeader)
 
   // Find value column — preference order varies by channel
   const valueCandidates: Record<string, string[]> = {
     shopify:      ['net sales', 'net revenue', 'revenue', 'total sales', 'gross sales'],
-    tiktok:       ['gmv', 'revenue', 'net revenue', 'settled gmv', 'total revenue'],
+    tiktok:       ['gmv', 'revenue', 'net revenue', 'settled gmv', 'total revenue', 'total settlement amount', 'settlement amount', 'total amount'],
     tiktok_spend: ['spend', 'cost', 'total cost', 'amount spent', 'total spend'],
     meta_spend:   ['amount spent', 'spend', 'cost', 'total cost'],
   }
@@ -103,7 +118,15 @@ function parseTable(grid: string[][], channel: string): { rows: {date:string,val
     rows.push({ date, value })
   }
 
-  return { rows, errors }
+  // Transaction-level statements (settlements, order lists) have many rows per
+  // day — sum them into one daily total. Daily exports pass through unchanged.
+  const byDate = new Map<string, number>()
+  for (const r of rows) byDate.set(r.date, (byDate.get(r.date) ?? 0) + r.value)
+  const daily = [...byDate.entries()]
+    .map(([date, value]) => ({ date, value: Math.round(value * 100) / 100 }))
+    .sort((a, b) => a.date.localeCompare(b.date))
+
+  return { rows: daily, errors }
 }
 
 function parseCSV(text: string, channel: string) {
