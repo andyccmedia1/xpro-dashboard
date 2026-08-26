@@ -37,16 +37,16 @@ function parseDate(raw: string): Date | null {
   return isNaN(dt.getTime()) ? null : dt
 }
 
-function parseCSV(text: string, channel: string): { rows: {date:string,value:number}[]; errors: string[] } {
-  const lines = text.trim().split(/\r?\n/)
-  if (lines.length < 2) return { rows: [], errors: ['CSV has no data rows'] }
+// Core parser operating on a cell grid — fed by CSV text or an Excel sheet.
+function parseTable(grid: string[][], channel: string): { rows: {date:string,value:number}[]; errors: string[] } {
+  if (grid.length < 2) return { rows: [], errors: ['File has no data rows'] }
 
   // Scan up to 25 rows to find the actual header row.
   // TikTok Shop exports have 8 rows of metadata before the real "Date,GMV,…" header.
   let headerLineIdx = -1
   let headers: string[] = []
-  for (let i = 0; i < Math.min(lines.length, 25); i++) {
-    const cols = lines[i].split(',').map(h => h.replace(/"/g, '').trim().toLowerCase())
+  for (let i = 0; i < Math.min(grid.length, 25); i++) {
+    const cols = grid[i].map(h => h.replace(/"/g, '').trim().toLowerCase())
     // Match common date column names exactly (avoid partial matches like "analysis date: …")
     const DATE_COLS = ['date', 'day', 'by day', 'report date', 'week', 'month']
     if (cols.some(h => DATE_COLS.includes(h))) {
@@ -81,9 +81,9 @@ function parseCSV(text: string, channel: string): { rows: {date:string,value:num
   const rows: {date:string,value:number}[] = []
   const errors: string[] = []
 
-  for (let i = headerLineIdx + 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue
-    const cells = lines[i].split(',').map(c => c.replace(/"/g, '').trim())
+  for (let i = headerLineIdx + 1; i < grid.length; i++) {
+    const cells = grid[i].map(c => c.replace(/"/g, '').trim())
+    if (cells.every(c => c === '')) continue
     const rawDate  = cells[dateIdx]  ?? ''
     const rawValue = cells[valueIdx] ?? ''
 
@@ -104,6 +104,36 @@ function parseCSV(text: string, channel: string): { rows: {date:string,value:num
   }
 
   return { rows, errors }
+}
+
+function parseCSV(text: string, channel: string) {
+  const grid = text.trim().split(/\r?\n/).map(line => line.split(','))
+  return parseTable(grid, channel)
+}
+
+// .xlsx/.xls: convert each sheet to a cell grid (dates formatted as YYYY-MM-DD)
+// and use the first sheet that parses successfully — statement exports sometimes
+// put metadata or summaries on their own tabs.
+async function parseWorkbook(file: File, channel: string): Promise<{ rows: {date:string,value:number}[]; errors: string[] }> {
+  const XLSX = await import('xlsx')
+  const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true })
+  let best: { rows: {date:string,value:number}[]; errors: string[] } = { rows: [], errors: ['Workbook has no sheets'] }
+  for (const name of wb.SheetNames) {
+    const ws = wb.Sheets[name]
+    if (!ws) continue
+    // raw:true + cellDates gives real Date objects for date cells; format them
+    // ourselves as YYYY-MM-DD (formatted text can come back as ambiguous 8/1/26)
+    const grid = (XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }) as unknown[][])
+      .map(row => row.map(c =>
+        c instanceof Date
+          ? `${c.getFullYear()}-${String(c.getMonth() + 1).padStart(2, '0')}-${String(c.getDate()).padStart(2, '0')}`
+          : String(c ?? ''),
+      ))
+    const parsed = parseTable(grid, channel)
+    if (parsed.rows.length > 0) return parsed
+    best = parsed.errors.length ? parsed : best
+  }
+  return best
 }
 
 // ── Upload card ───────────────────────────────────────────────────────────────
@@ -131,8 +161,16 @@ function UploadCard({ channel, onSuccess }: { channel: typeof CHANNELS[0]; onSuc
     setResult(null)
     setParseErrors([])
 
-    const text = await file.text()
-    const { rows, errors } = parseCSV(text, channel.id)
+    const isExcel = /\.(xlsx|xls)$/i.test(file.name)
+    let rows: { date: string; value: number }[] = []
+    let errors: string[] = []
+    try {
+      ;({ rows, errors } = isExcel
+        ? await parseWorkbook(file, channel.id)
+        : parseCSV(await file.text(), channel.id))
+    } catch (e) {
+      errors = [e instanceof Error ? e.message : 'Could not read the file']
+    }
     setParseErrors(errors)
 
     if (rows.length === 0) { setStatus('error'); return }
@@ -180,7 +218,7 @@ function UploadCard({ channel, onSuccess }: { channel: typeof CHANNELS[0]; onSuc
         <input
           ref={fileRef}
           type="file"
-          accept=".csv"
+          accept=".csv,.xlsx,.xls"
           className="hidden"
           onChange={handleFile}
           disabled={status === 'uploading' || status === 'parsing'}
@@ -189,8 +227,9 @@ function UploadCard({ channel, onSuccess }: { channel: typeof CHANNELS[0]; onSuc
           <>
             <span className="text-2xl mb-1">📂</span>
             <span className="text-sm text-gray-400">
-              {status === 'done' ? 'Upload another CSV' : 'Click to upload CSV'}
+              {status === 'done' ? 'Upload another file' : 'Click to upload CSV or Excel'}
             </span>
+            <span className="text-xs text-gray-600 mt-0.5">.csv · .xlsx · .xls</span>
           </>
         ) : (
           <>
