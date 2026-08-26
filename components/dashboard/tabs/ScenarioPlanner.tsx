@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceArea,
 } from 'recharts'
-import { DEFAULT_WEIGHTS, type PeriodWeights } from '@/lib/forecast'
+import { DEFAULT_WEIGHTS, type PeriodWeights, type ForecastRow } from '@/lib/forecast'
 import {
   computeFor, Z, SCEN_COLORS, n0, n2,
   type Sku, type Blackout, type Scenario, type Policy, type SafetyMethod, type Safety, type Seasonality,
@@ -149,6 +149,80 @@ export default function ScenarioPlanner() {
   const mySc = sku ? scenarios.filter(sc => sc.msku === sku.msku) : []
   const scenCount = (msku: string) => scenarios.filter(sc => sc.msku === msku).length
 
+  // All routes (baseline first), and each route's first simulated PO
+  const allRoutes = useMemo(
+    () => (baseline ? [{ name: 'Live baseline', color: '#6366f1', ...baseline }, ...runs] : []),
+    [baseline, runs],
+  )
+  function firstPO(r: { rows: ForecastRow[] }) {
+    const t = r.rows.find(x => x.reorderTrigger)
+    if (!t) return null
+    return {
+      date: t.date,
+      qty: Math.round(t.reorderAmount),
+      arrives: r.rows[t.reorderArrivalDay]?.date ?? null,
+      note: t.reorderNote || null,
+    }
+  }
+  const poPlans = allRoutes
+    .map(r => ({ name: r.name, color: r.color, po: firstPO(r) }))
+    .filter((p): p is { name: string; color: string; po: NonNullable<ReturnType<typeof firstPO>> } => p.po != null)
+
+  // ── AI Insights (Claude) — judges the routes ───────────────────────────────
+  const [aiText,  setAiText]  = useState('')
+  const [aiState, setAiState] = useState<'idle' | 'running' | 'done' | 'error'>('idle')
+  const [aiErr,   setAiErr]   = useState('')
+  const [aiModel, setAiModel] = useState('')
+
+  async function runInsights() {
+    if (!sku || !settings || !baseline) return
+    setAiState('running'); setAiText(''); setAiErr('')
+    try {
+      const routes = allRoutes.map(r => {
+        const sc = scenarios.find(s => s.msku === sku.msku && s.name === r.name)
+        return {
+          name: r.name,
+          base_vel: Math.round(r.base * 10) / 10,
+          pinned_velocity: sc?.base_velocity ?? null,
+          stockout: r.analytics.firstStockoutDate,
+          first_po: firstPO(r),
+          reorders_in_horizon: r.analytics.reorderCount,
+          min_inv: Math.round(r.analytics.minInventory),
+          end_inv: Math.round(r.rows[r.rows.length - 1]?.inventory ?? 0),
+          service_pct: Math.round(r.analytics.serviceLevel * 1000) / 10,
+          notes: sc?.notes ?? null,
+        }
+      })
+      const res = await fetch('/api/insights/scenarios', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          today: today.toLocaleDateString('en-CA'),
+          horizon,
+          sku: {
+            msku: sku.msku, on_hand: sku.on_hand,
+            lead_time_days: sku.lead_time_days, lead_time_std_days: sku.lead_time_std_days,
+            inbounds: sku.inbounds, promotions: sku.promotions,
+          },
+          settings: { policy: settings.policy, safety_method: settings.safety.method, blackouts: settings.blackouts },
+          routes,
+        }),
+      })
+      if (!res.ok || !res.body) throw new Error(await res.text().catch(() => `HTTP ${res.status}`))
+      setAiModel(res.headers.get('X-Model') ?? '')
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        setAiText(t => t + decoder.decode(value, { stream: true }))
+      }
+      setAiState('done')
+    } catch (e) {
+      setAiState('error')
+      setAiErr(e instanceof Error ? e.message : 'Analysis failed')
+    }
+  }
+
   return (
     <div className="space-y-6">
 
@@ -161,8 +235,16 @@ export default function ScenarioPlanner() {
             Uses the same SKU data, seasonality, deals and blackouts as the Forecast tab.
           </p>
         </div>
-        <div className="flex gap-2 items-center text-xs">
-          <span className="text-gray-500">SKU</span>
+        <div className="flex gap-2 items-center text-xs flex-wrap">
+          <button
+            onClick={runInsights}
+            disabled={aiState === 'running' || loading || !sku}
+            title="Ask Claude to compare the routes and recommend when to order"
+            className="px-3 py-2 rounded-lg text-sm font-medium text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition"
+          >
+            {aiState === 'running' ? '✦ Judging routes…' : '✦ AI Insights'}
+          </button>
+          <span className="text-gray-500 ml-2">SKU</span>
           <select
             value={selected}
             onChange={e => setSelected(e.target.value)}
@@ -206,6 +288,47 @@ export default function ScenarioPlanner() {
                   sub={baseline.analytics.firstReorderDate ? `next PO ${baseline.analytics.firstReorderDate}` : 'no PO in horizon'}
                   accent={baseline.analytics.firstStockoutDate ? 'text-rose-400' : 'text-emerald-400'} />
           </div>
+
+          {/* ── AI Insights panel ── */}
+          {aiState !== 'idle' && (
+            <div className="bg-gray-900 border border-indigo-900/60 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <span className="text-indigo-400">✦</span> Route Recommendation
+                  <span className="text-xs font-normal text-gray-500">{sku.msku} · {allRoutes.length} route(s) · {aiModel || 'Claude'}</span>
+                </h3>
+                {aiState === 'running' && <span className="text-xs text-indigo-400 animate-pulse">thinking…</span>}
+                {aiState === 'done' && (
+                  <button onClick={runInsights} className="text-xs text-gray-500 hover:text-gray-300">↻ Regenerate</button>
+                )}
+              </div>
+              {aiState === 'error' ? (
+                <p className="text-sm text-rose-400">⚠ {aiErr}</p>
+              ) : aiText === '' ? (
+                <p className="text-sm text-gray-500 animate-pulse">Comparing the routes and thinking — this can take a minute…</p>
+              ) : (
+                <div className="text-sm text-gray-300 leading-relaxed whitespace-pre-wrap">{aiText}</div>
+              )}
+            </div>
+          )}
+
+          {/* ── Order plan (when each route says to place the next PO) ── */}
+          {poPlans.length > 0 && (
+            <div className="bg-amber-950/30 border border-amber-900/50 rounded-xl px-4 py-3 space-y-1.5">
+              <p className="text-xs font-semibold text-amber-400 uppercase tracking-wider">Order plan — next PO per route</p>
+              {poPlans.map(p => (
+                <p key={p.name} className="text-sm text-gray-300 flex items-center gap-2 flex-wrap">
+                  <span className="w-3 h-0.5 rounded shrink-0" style={{ background: p.color }} />
+                  <span className="text-white">{p.name}:</span>
+                  place <span className="text-amber-300 font-medium">{n0(p.po.qty)} units</span> by
+                  <span className="text-amber-300 font-medium">{p.po.date}</span>
+                  <span className="text-gray-500">→ arrives {p.po.arrives ?? 'beyond horizon'}</span>
+                  {p.po.note && <span className="text-amber-500 text-xs">⚠ {p.po.note}</span>}
+                </p>
+              ))}
+              <p className="text-xs text-gray-600">★ on the chart marks each order-placement day. Routes without a line here need no new PO within the horizon.</p>
+            </div>
+          )}
 
           {/* ── Scenario list + save form ── */}
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
@@ -289,7 +412,11 @@ export default function ScenarioPlanner() {
                 <LineChart
                   data={baseline.rows.map((r, idx) => ({
                     ...r,
-                    ...Object.fromEntries(runs.map((s, i) => [`scen${i}`, Math.round(s.rows[idx]?.inventory ?? 0)])),
+                    baseM: r.reorderTrigger ? r.inventory : null,
+                    ...Object.fromEntries(runs.flatMap((s, i) => [
+                      [`scen${i}`, Math.round(s.rows[idx]?.inventory ?? 0)],
+                      [`scenM${i}`, s.rows[idx]?.reorderTrigger ? Math.round(s.rows[idx].inventory) : null],
+                    ])),
                   }))}
                   margin={{ top: 16, right: 12, bottom: 0, left: 0 }}
                 >
@@ -318,14 +445,21 @@ export default function ScenarioPlanner() {
                     <Line key={s.name} type="monotone" dataKey={`scen${i}`} name={s.name}
                           stroke={s.color} dot={false} strokeWidth={2} strokeDasharray="6 3" />
                   ))}
+                  {/* ★ order-placement markers per route */}
+                  <Line type="monotone" dataKey="baseM" name="Baseline PO" stroke="none" isAnimationActive={false}
+                        dot={<StarDot color="#6366f1" />} activeDot={false} legendType="none" />
+                  {runs.map((s, i) => (
+                    <Line key={'m' + s.name} type="monotone" dataKey={`scenM${i}`} name={`${s.name} PO`} stroke="none"
+                          isAnimationActive={false} dot={<StarDot color={s.color} />} activeDot={false} legendType="none" />
+                  ))}
                   <Line type="monotone" dataKey="reorderPoint" name="Reorder point" stroke="#f59e0b" dot={false} strokeDasharray="4 3" strokeWidth={1.5} />
                   <ReferenceLine y={0} stroke="#ef4444" strokeDasharray="2 2" />
                 </LineChart>
               </ResponsiveContainer>
             </div>
             <p className="text-xs text-gray-600 mt-2">
-              Indigo solid = live baseline · dashed colored lines = scenarios · amber dashed = reorder point ·
-              purple bands = deals · slate/cyan bands = blackout windows.
+              Indigo solid = live baseline · dashed colored lines = scenarios · <span className="text-amber-400">★ = place PO that day</span> (colored per route) ·
+              amber dashed = reorder point · purple bands = deals · slate/cyan bands = blackout windows.
             </p>
           </div>
 
@@ -340,6 +474,7 @@ export default function ScenarioPlanner() {
                       <th className="px-3 py-3 font-medium text-right">Base vel</th>
                       <th className="px-3 py-3 font-medium">Stockout</th>
                       <th className="px-3 py-3 font-medium">Next PO by</th>
+                      <th className="px-3 py-3 font-medium">Arrives</th>
                       <th className="px-3 py-3 font-medium text-right">PO qty</th>
                       <th className="px-3 py-3 font-medium text-right">Min inv</th>
                       <th className="px-3 py-3 font-medium text-right">End inv</th>
@@ -347,7 +482,7 @@ export default function ScenarioPlanner() {
                     </tr>
                   </thead>
                   <tbody>
-                    {[{ name: 'Live baseline', color: '#6366f1', ...baseline }, ...runs].map(r => (
+                    {allRoutes.map(r => (
                       <tr key={r.name} className="border-b border-gray-800/60">
                         <td className="px-4 py-3">
                           <span className="inline-flex items-center gap-2 text-white">
@@ -361,6 +496,7 @@ export default function ScenarioPlanner() {
                             : <span className="text-emerald-400">none</span>}
                         </td>
                         <td className="px-3 py-3 text-amber-400">{r.analytics.firstReorderDate ?? '—'}</td>
+                        <td className="px-3 py-3 text-gray-400">{firstPO(r)?.arrives ?? '—'}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-gray-300">{r.analytics.firstReorderQty > 0 ? n0(r.analytics.firstReorderQty) : '—'}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-gray-300">{n0(r.analytics.minInventory)}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-gray-300">{n0(r.rows[r.rows.length - 1]?.inventory ?? 0)}</td>
@@ -375,6 +511,14 @@ export default function ScenarioPlanner() {
         </>
       )}
     </div>
+  )
+}
+
+// ★ marker at order-placement days (recharts injects cx/cy/value per point)
+function StarDot({ cx, cy, value, color }: { cx?: number; cy?: number; value?: number | null; color?: string }) {
+  if (cx == null || cy == null || value == null) return null
+  return (
+    <text x={cx} y={cy - 7} textAnchor="middle" fill={color ?? '#f59e0b'} fontSize={15}>★</text>
   )
 }
 
