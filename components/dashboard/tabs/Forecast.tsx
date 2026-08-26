@@ -15,6 +15,11 @@ type Inbound = { date: string; qty: number }
 type Promo = { start: string; end: string; mult: number; label: string }
 // A calendar constraint: factory closed (no PO placement) or FBA receiving closed
 type Blackout = { start: string; end: string; label: string; kind: 'factory' | 'receiving' }
+// A saved what-if scenario: overrides only, null = inherit the live value
+type Scenario = { msku: string; name: string; base_velocity: number | null; inbounds: Inbound[] | null; promotions: Promo[] | null; notes: string | null; updated_at?: string }
+
+// Overlay colors for scenario lines (fixed order — orange, teal, violet)
+const SCEN_COLORS = ['#f97316', '#14b8a6', '#a855f7']
 
 type Sku = {
   msku: string
@@ -97,14 +102,15 @@ function seasonalityMap(season: Seasonality, today: Date): Record<number, number
   return map
 }
 
-function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety, season: Seasonality, blackouts: Blackout[]) {
+function computeFor(sku: Sku, weights: PeriodWeights, horizon: number, policy: Policy, today: Date, safety: Safety, season: Seasonality, blackouts: Blackout[], baseOverride?: number) {
   // History correction: for a recently-stocked SKU, windows longer than its
   // selling history are diluted by pre-stock zero-demand days. Divide by the
   // actual days selling instead of the full window so the rate isn't dragged
   // down (units_N / min(N, history_days)). history_days = 0 → no correction.
   const hd = sku.history_days
   const ev = (unitsN: number, vN: number, N: number) => (hd > 0 && hd < N ? unitsN / hd : vN)
-  const base = weightedVelocity({
+  // baseOverride: what-if scenarios pin the base rate instead of deriving it
+  const base = baseOverride ?? weightedVelocity({
     v7:  ev(sku.units_7,  sku.v7,  7),
     v14: ev(sku.units_14, sku.v14, 14),
     v30: ev(sku.units_30, sku.v30, 30),
@@ -353,6 +359,14 @@ export default function Forecast() {
   const [histInfo,  setHistInfo]  = useState<Record<string, { history_days: number; selling_days: number; first_sale: string | null; oos_days: number } | string>>({})
   const detailRef = useRef<HTMLDivElement>(null)
 
+  // ── Saved what-if scenarios ─────────────────────────────────────────────────
+  const [scenarios,  setScenarios]  = useState<Scenario[]>([])
+  const [activeScen, setActiveScen] = useState<Record<string, string[]>>({})   // msku -> overlaid names
+  const [scenName,   setScenName]   = useState('')
+  const [scenVel,    setScenVel]    = useState('')   // '' = live velocity
+  const [scenBusy,   setScenBusy]   = useState(false)
+  const [scenErr,    setScenErr]    = useState('')
+
   // ── AI Insights (Claude) — reviews the reorder plan ─────────────────────────
   const [aiText,  setAiText]  = useState('')
   const [aiState, setAiState] = useState<'idle' | 'running' | 'done' | 'error'>('idle')
@@ -379,6 +393,11 @@ export default function Forecast() {
         setSkus(d.skus ?? []); setSource(d.source ?? 'ledger'); setLoading(false)
       })
       .catch(e => { setLoadErr(e instanceof Error ? e.message : 'Failed to load'); setLoading(false) })
+    // Saved scenarios (non-fatal — the tab works without them)
+    fetch('/api/forecast/scenarios')
+      .then(r => r.json())
+      .then(d => { if (Array.isArray(d.scenarios)) setScenarios(d.scenarios) })
+      .catch(() => {})
   }, [])
   useEffect(() => { load() }, [load])
 
@@ -401,6 +420,62 @@ export default function Forecast() {
 
   const sel = computed.find(c => c.sku.msku === selected) ?? null
   const selCustomSeason = (sel?.sku.seasonality?.length ?? 0) === 12
+
+  // Simulate each overlaid scenario against LIVE data (overrides only)
+  const selScens = useMemo(() => {
+    if (!sel) return []
+    return (activeScen[sel.sku.msku] ?? [])
+      .map((name, i) => {
+        const sc = scenarios.find(s => s.msku === sel.sku.msku && s.name === name)
+        if (!sc) return null
+        const variant: Sku = {
+          ...sel.sku,
+          inbounds:   sc.inbounds   ?? sel.sku.inbounds,
+          promotions: sc.promotions ?? sel.sku.promotions,
+        }
+        const run = computeFor(variant, weights, horizon, policy, today, safety, season, blackouts, sc.base_velocity ?? undefined)
+        return { name, color: SCEN_COLORS[i % SCEN_COLORS.length], sc, ...run }
+      })
+      .filter((s): s is NonNullable<typeof s> => s != null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sel, activeScen, scenarios, weights, horizon, policy, today, safety, season, blackouts])
+
+  async function saveScenario(s: Sku) {
+    if (!scenName.trim()) { setScenErr('Give the scenario a name first'); return }
+    setScenBusy(true); setScenErr('')
+    try {
+      const vel = scenVel.trim() === '' ? null : Math.max(0, parseFloat(scenVel) || 0)
+      const res = await fetch('/api/forecast/scenarios', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          msku: s.msku, name: scenName.trim(), base_velocity: vel,
+          inbounds: s.inbounds, promotions: s.promotions,   // snapshot the current plan
+        }),
+      })
+      if (!res.ok) { const j = await res.json().catch(() => ({})); throw new Error(j.error || `HTTP ${res.status}`) }
+      const saved = scenName.trim()
+      setScenarios(prev => [
+        { msku: s.msku, name: saved, base_velocity: vel, inbounds: s.inbounds, promotions: s.promotions, notes: null },
+        ...prev.filter(x => !(x.msku === s.msku && x.name === saved)),
+      ])
+      setActiveScen(prev => ({ ...prev, [s.msku]: [...new Set([...(prev[s.msku] ?? []), saved])].slice(0, 3) }))
+      setScenName(''); setScenVel('')
+    } catch (e) {
+      setScenErr(e instanceof Error ? e.message : 'Save failed')
+    } finally { setScenBusy(false) }
+  }
+
+  async function deleteScenario(msku: string, name: string) {
+    setScenarios(prev => prev.filter(x => !(x.msku === msku && x.name === name)))
+    setActiveScen(prev => ({ ...prev, [msku]: (prev[msku] ?? []).filter(n => n !== name) }))
+    await fetch(`/api/forecast/scenarios?msku=${encodeURIComponent(msku)}&name=${encodeURIComponent(name)}`, { method: 'DELETE' }).catch(() => {})
+  }
+
+  const toggleScen = (msku: string, name: string) =>
+    setActiveScen(prev => {
+      const cur = prev[msku] ?? []
+      return { ...prev, [msku]: cur.includes(name) ? cur.filter(n => n !== name) : [...cur, name].slice(0, 3) }
+    })
 
   // Send the on-screen forecast state (exactly what the tab computed) to Claude
   async function runInsights() {
@@ -1115,6 +1190,74 @@ export default function Forecast() {
                 )}
               </div>
 
+              {/* Saved what-if scenarios — overlay alternate routes on the chart */}
+              <div className="border-t border-gray-800 pt-4">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs text-gray-500 uppercase tracking-wider">Scenarios · this SKU</label>
+                  <span className="text-xs text-gray-600">tick up to 3 to overlay on the chart</span>
+                </div>
+                {scenarios.filter(sc => sc.msku === sel.sku.msku).length > 0 && (
+                  <div className="space-y-1.5 mb-3">
+                    {scenarios.filter(sc => sc.msku === sel.sku.msku).map(sc => {
+                      const active = (activeScen[sel.sku.msku] ?? []).includes(sc.name)
+                      const run = selScens.find(r => r.name === sc.name)
+                      return (
+                        <div key={sc.name} className="flex items-center gap-2 flex-wrap text-sm">
+                          <label className="flex items-center gap-2 cursor-pointer select-none">
+                            <input type="checkbox" checked={active} onChange={() => toggleScen(sel.sku.msku, sc.name)} className="accent-indigo-500 w-3.5 h-3.5" />
+                            {run && <span className="w-3 h-0.5 rounded" style={{ background: run.color }} />}
+                            <span className="text-white">{sc.name}</span>
+                          </label>
+                          <span className="text-xs text-gray-500">
+                            {sc.base_velocity != null ? `${sc.base_velocity}/day` : 'live velocity'}
+                            {sc.inbounds ? ` · ${sc.inbounds.length} PO snapshot` : ''}
+                          </span>
+                          {run && (
+                            <span className="text-xs">
+                              {run.analytics.firstStockoutDate
+                                ? <span className="text-rose-400">stockout {run.analytics.firstStockoutDate}</span>
+                                : <span className="text-emerald-400">no stockout</span>}
+                              {run.analytics.firstReorderDate && (
+                                <span className="text-amber-400"> · new PO by {run.analytics.firstReorderDate} ({n0(run.analytics.firstReorderQty)}u)</span>
+                              )}
+                              <span className="text-gray-500"> · min {n0(run.analytics.minInventory)}u</span>
+                            </span>
+                          )}
+                          <button onClick={() => deleteScenario(sel.sku.msku, sc.name)}
+                                  className="text-gray-600 hover:text-rose-400 text-xs px-1" title="Delete scenario">✕</button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+                <div className="flex items-center gap-2 flex-wrap">
+                  <input
+                    type="text" placeholder="scenario name (e.g. Push to 150)"
+                    value={scenName} onChange={e => setScenName(e.target.value)}
+                    className="w-48 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+                  />
+                  <input
+                    type="number" min={0} step={1} placeholder={`${sel.base.toFixed(0)} (live)`}
+                    value={scenVel} onChange={e => setScenVel(e.target.value)}
+                    className="w-28 bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white text-center"
+                    title="Base units/day for this scenario — leave blank to always use the live blended velocity"
+                  />
+                  <span className="text-xs text-gray-600">u/day</span>
+                  <button
+                    onClick={() => saveScenario(sel.sku)}
+                    disabled={scenBusy}
+                    className="text-xs font-medium text-indigo-400 hover:text-indigo-300 disabled:opacity-50 px-2 py-1.5 rounded border border-gray-700 hover:bg-gray-800"
+                  >
+                    {scenBusy ? 'Saving…' : '+ Save scenario'}
+                  </button>
+                  {scenErr && <span className="text-xs text-rose-400">⚠ {scenErr}</span>}
+                </div>
+                <p className="text-xs text-gray-600 mt-1">
+                  Captures the current inbounds &amp; deals as a snapshot; velocity is pinned to the number you enter (blank = tracks live).
+                  Scenarios re-simulate against fresh data every time — outcomes stay current.
+                </p>
+              </div>
+
               {/* Sales history correction — fixes diluted windows on recently-stocked SKUs */}
               <div className="border-t border-gray-800 pt-4">
                 <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
@@ -1335,7 +1478,11 @@ export default function Forecast() {
               <div className="h-72">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart
-                    data={sel.rows.map(r => ({ ...r, reorderMarker: r.reorderTrigger ? r.inventory : null }))}
+                    data={sel.rows.map((r, idx) => ({
+                      ...r,
+                      reorderMarker: r.reorderTrigger ? r.inventory : null,
+                      ...Object.fromEntries(selScens.map((s, i) => [`scen${i}`, Math.round(s.rows[idx]?.inventory ?? 0)])),
+                    }))}
                     margin={{ top: 16, right: 12, bottom: 0, left: 0 }}
                   >
                     <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
@@ -1380,6 +1527,10 @@ export default function Forecast() {
                       />
                     ))}
                     <Line type="monotone" dataKey="inventory" name="On-hand" stroke="#6366f1" dot={false} strokeWidth={2} />
+                    {selScens.map((s, i) => (
+                      <Line key={s.name} type="monotone" dataKey={`scen${i}`} name={s.name}
+                            stroke={s.color} dot={false} strokeWidth={2} strokeDasharray="6 3" />
+                    ))}
                     <Line type="monotone" dataKey="reorderPoint" name="Reorder point" stroke="#f59e0b" dot={false} strokeDasharray="4 3" strokeWidth={1.5} />
                     {/* Star at each reorder-trigger point */}
                     <Line type="monotone" dataKey="reorderMarker" name="Reorder placed" stroke="none"
@@ -1389,7 +1540,7 @@ export default function Forecast() {
                 </ResponsiveContainer>
               </div>
               <p className="text-xs text-gray-600">
-                Indigo = projected on-hand · amber dashed = reorder point (lead-time demand + safety stock) ·
+                Indigo = projected on-hand · dashed colored lines = overlaid scenarios · amber dashed = reorder point (lead-time demand + safety stock) ·
                 <span className="text-amber-400"> ★ = reorder placed</span> (hover for the order qty) ·
                 <span className="text-purple-400"> purple band = deal window</span> (red band = deal runs dry) ·
                 <span className="text-slate-400"> slate band = factory closed</span> ·

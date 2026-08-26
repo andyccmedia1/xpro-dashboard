@@ -286,6 +286,37 @@ create policy "authenticated users can read forecast_settings"
 grant select, insert, update, delete on forecast_settings to service_role;
 
 
+-- ── 5e. forecast_scenarios (saved what-if runs per SKU) ──────
+-- Named scenarios store OVERRIDES only (base velocity, inbounds, promotions;
+-- null = inherit live values), so each open re-simulates against current data
+-- rather than freezing a stale projection. Rendered as overlay lines on the
+-- Forecast tab's SKU chart for side-by-side route comparison.
+
+create table if not exists forecast_scenarios (
+  brand         varchar(50)  not null default 'xpro',
+  msku          text         not null,
+  name          text         not null,
+  base_velocity numeric,          -- null = use the live blended velocity
+  inbounds      jsonb,           -- null = inherit the SKU's live inbounds
+  promotions    jsonb,           -- null = inherit the SKU's live promotions
+  notes         text,
+  updated_at    timestamptz  not null default now(),
+
+  primary key (brand, msku, name)
+);
+
+create or replace trigger forecast_scenarios_updated_at
+  before update on forecast_scenarios
+  for each row execute function set_updated_at();
+
+alter table forecast_scenarios enable row level security;
+
+create policy "authenticated users can read forecast_scenarios"
+  on forecast_scenarios for select to authenticated using (true);
+
+grant select, insert, update, delete on forecast_scenarios to service_role;
+
+
 -- ── 6. sku_velocity (view) ───────────────────────────────────
 -- TOTAL demand per MSKU over 7/14/30/60/90-day windows ending YESTERDAY =
 --   Amazon-marketplace units ordered (amazon_sku_windows, pre-computed windows)
