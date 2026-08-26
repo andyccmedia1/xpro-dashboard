@@ -11,6 +11,7 @@ import Heatmap         from '@/components/dashboard/tabs/Heatmap'
 import BudgetAllocator from '@/components/dashboard/tabs/BudgetAllocator'
 import Inventory       from '@/components/dashboard/tabs/Inventory'
 import Forecast        from '@/components/dashboard/tabs/Forecast'
+import ScenarioPlanner from '@/components/dashboard/tabs/ScenarioPlanner'
 
 const TABS = [
   { id: 'overview',  label: 'Overview' },
@@ -21,6 +22,7 @@ const TABS = [
   { id: 'budget',    label: 'Budget Allocator' },
   { id: 'inventory', label: 'Inventory' },
   { id: 'forecast',  label: 'Forecast' },
+  { id: 'scenarios', label: 'Scenario Planner' },
   { id: 'data',      label: 'Data Manager' },
 ]
 
@@ -125,6 +127,7 @@ export default function DashboardShell({ userEmail }: { userEmail: string }) {
         {activeTab === 'budget'   && <BudgetAllocator />}
         {activeTab === 'inventory'&& <Inventory />}
         {activeTab === 'forecast' && <Forecast />}
+        {activeTab === 'scenarios'&& <ScenarioPlanner />}
         {activeTab === 'data'     && <DataManager />}
       </main>
     </div>
